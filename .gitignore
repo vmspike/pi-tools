@@ -1,8 +1,6 @@
-# Ignore all files directly in subdirs except some specific, keep only directories
-/*/*
-!/*/*/
-!/*/README.md
-!/show-temperature/**
+# Ignore all files directly in deb packages sources subdirs except some specific, keep only directories
+/tricolor-led/*
+!/tricolor-led/README.md
 
 # Ignore all directories inside /pkgname-pkgversion/debian/ except some specific
 /*/*/debian/*/
