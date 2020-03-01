@@ -1,0 +1,374 @@
+#!/bin/bash
+
+##
+# This script creates wireless Access Point on specified interface.
+# Compatible only with single AP hosts, if other AP exists its setup can be overwritten.
+#
+# Usage:
+#     create-ap IFACE SSID PASSWORD [SUBNET] [COUNTRY] [FORWARDING] [HOSTAPD_CONF] [HOSTAPD_DRIVER]
+#
+# Defaults:
+#   SUBNET=192.168.43.0/24
+#   COUNTRY=00  # World
+#   FORWARDING=0  # True values: 1|true|yes|y|on|ok
+#   HOSTAPD_CONF=/etc/hostapd/hostapd.conf
+#   HOSTAPD_DRIVER=nl80211
+##
+
+
+### Functions
+
+##
+# Convert decimal number to IPv4 address
+##
+dec2ip() {
+    local _var _res _e _octet _dec
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    _dec=$1
+    for _e in {3..0}; do
+        (( _octet = _dec/256**_e ))
+        (( _dec -= _octet*256**_e ))
+        _res+=.${_octet}
+    done
+    _res=${_res:1}
+
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
+}
+
+##
+# Convert IPv4 address to decimal number
+##
+ip2dec() {
+    local _var _res _a _b _c _d
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    IFS=. read -r _a _b _c _d <<<"$1"
+    (( _res = _a*256**3 + _b*256**2 + _c*256 + _d ))
+
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
+}
+
+##
+# Return next IPv4 address
+##
+next_ip() {
+    local _var _res _ip
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    ip2dec -v _ip "$1"
+    dec2ip -v _ip $((_ip+1))
+    _res=${_ip}
+
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
+}
+
+##
+# Convert CIDR to IPv4 MASK
+##
+cidr2mask() {
+    local _var _res
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+    [[ -z $1 ]] && set 0
+
+    set -- $(( 5-($1/8) )) 255 255 255 255 $(( (255<<(8 - ($1%8)))&255 )) 0 0 0
+    if (($1 > 1)); then shift "$1"; else shift; fi
+    _res=${1:-0}.${2:-0}.${3:-0}.${4:-0}
+
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
+}
+
+##
+# Validate IPv4/CIDR
+##
+validate_ip4cidr() {
+    local _re
+    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    [[ "$1" =~ ${_re} ]] && return 0 || return 1
+}
+### END Functions
+
+
+# Be verbose if 1
+[[ -z ${DEBUG} ]] && DEBUG=0
+
+### Positional vars
+IFACE=$1
+SSID=$2
+PW=$3
+SUBNET=${4:-192.168.43.0/24}
+COUNTRY=${5::2}; COUNTRY=${COUNTRY^^}  # First two letters only, converted to uppercase
+if ! [[ "${COUNTRY}" =~ ^([A-Z][A-Z]|00)$ ]]; then
+    echo "WARNING: Country is invalid or not set. Drop to 00 (World)." >&2
+    COUNTRY=00
+fi
+# Convert FORWARDING to boolean
+case "${6,,}" in
+    1|true|yes|y|on|ok) FORWARDING=1;;
+    *) FORWARDING=0;;
+esac
+HOSTAPD_CONF=${7:-/etc/hostapd/hostapd.conf}
+HOSTAPD_DRIVER=${8:-nl80211}
+# # Replace default HOSTAPD_DRIVER for some adapters
+# tmp=$(exec -c udevadm info -q property "/sys/class/net/${IFACE}")
+# tmp=${tmp#*$'\n'ID_NET_DRIVER=}
+# tmp=${tmp%%$'\n'*}
+# [[ "${tmp}" == 'r8188eu' ]] && HOSTAPD_DRIVER=rtl871xdrv
+
+# Set interface metric
+case "${IFACE}" in
+    eth0) METRIC=9;;
+    wlan[0-9]|wlan[1-9][0-9]) METRIC=$((${IFACE#wlan} + 10));;
+    *) METRIC=19999;;
+esac
+
+### END Positional vars
+
+
+### Verifications
+for opt in IFACE SSID PW; do
+    if [[ -z ${!opt} ]]; then
+        echo "ERROR: ${opt} have to be specified" >&2
+        exit 1
+    fi
+done
+if ! validate_ip4cidr "${SUBNET}"; then
+    echo "ERROR: Invalid SUBNET (IPv4/CIDR): ${SUBNET}" >&2
+    exit 1
+fi
+### END Verifications
+
+
+DNSMASQ_IGNORED_EXTS=$(exec -c grep -m1 ^CONFIG_DIR= /etc/default/dnsmasq)
+DNSMASQ_IGNORED_EXTS=${DNSMASQ_IGNORED_EXTS#CONFIG_DIR=*,}
+DNSMASQ_IGNORED_EXTS=${DNSMASQ_IGNORED_EXTS//,/ }  # The string like '.dpkg-dist .dpkg-old .dpkg-new'
+
+NETWORK=${SUBNET%/*}  # IP part of SUBNET
+next_ip -v IP "${NETWORK}"
+CIDR=${SUBNET#*/}  # CIDR part of SUBNET
+cidr2mask -v MASK "${CIDR}"
+# Check if interfaces with the same address exists (uniqueness required for dnsmasq)
+if [[ -n "${DNSMASQ_IGNORED_EXTS}" ]]; then
+    listen_address_conflict_files=$(exec -c grep -l --exclude \*${DNSMASQ_IGNORED_EXTS// / --exclude *} --exclude "/etc/dnsmasq.d/${IFACE}" "^listen-address=${IP}$" /etc/dnsmasq.{conf,d/*})
+else
+    listen_address_conflict_files=$(exec -c grep -l --exclude "/etc/dnsmasq.d/${IFACE}" "^listen-address=${IP}$" /etc/dnsmasq.{conf,d/*})
+fi
+if [[ -n "${listen_address_conflict_files}" ]]; then
+    echo "WARNING: The same subnet ${SUBNET} already used by another interface(s) in dnsmasq setup. Disabling this conf files..." >&2
+    while read -r f ; do
+        mv -vfT "${f}" "${f}.dpkg-old"
+    done <<<"${listen_address_conflict_files}"
+    # exit 1
+fi
+
+PW_OPT="wpa_psk=$(wpa_passphrase "${SSID}" "${PW}" | grep -om1 -E '[0-9a-f]{64}')"
+if (($?)); then
+    echo "WARNING: Failed to encrypt password, will be used as plaintext." >&2
+    PW_OPT="wpa_passphrase=${PW}"
+    PSK=''
+else
+    PSK=${PW_OPT#wpa_psk=}
+    # PW_OPT="#wpa_passphrase=${PW}"$'\n'"${PW_OPT}"  # Keep plaintext password in comment
+fi
+
+# Some third party apps expect hostapd conf file to have password in plaintext, so add it
+if [[ ${PW_OPT::8} == 'wpa_psk=' ]]; then
+    PW_OPT="#${PW_OPT}"$'\n'"wpa_passphrase=${PW}"
+fi
+
+((DEBUG)) && echo -n "=== Variables:
+# Required:
+IFACE='${IFACE}' SSID='${SSID}' PW='${PW::2}***${PW: -2}' SUBNET=${SUBNET}
+# Optional:
+COUNTRY=${COUNTRY} FORWARDING=${FORWARDING}
+# Generated:
+NETWORK=${NETWORK} IP=${IP} CIDR=${CIDR} MASK=${MASK} PSK=${PSK}
+"
+
+# echo '=== Install required soft'
+# export DEBIAN_FRONTEND=noninteractive
+# # apt-get -yqq update
+# if ! apt-get -yq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install \
+#         dnsmasq hostapd; then
+#     echo 'ERROR: Failed to install: dnsmasq hostapd'
+#     exit 100
+# fi
+# systemctl stop dnsmasq
+# systemctl stop hostapd
+
+echo "=== Down ${IFACE}"
+ifdown --force "${IFACE}"
+ip addr flush dev "${IFACE}"
+
+if [[ -f /etc/dhcpcd.conf ]]; then
+    echo "=== Disable ${IFACE} in /etc/dhcpcd.conf"
+    if ! grep -q "^denyinterfaces ${IFACE}" /etc/dhcpcd.conf; then
+        txt=$'\n'"# Disable ${IFACE} because it is Access Point now"$'\n'"denyinterfaces ${IFACE}"
+        if ! grep -q '^interface' /etc/dhcpcd.conf; then
+            echo "${txt}" >>/etc/dhcpcd.conf
+        else
+            sed -i "s|^interface|${txt//$'\n'/\\n}\n\ninterface|" /etc/dhcpcd.conf
+        fi
+    fi
+    echo '=== Effective content of /etc/dhcpcd.conf:'
+    grep -v -e '^$' -e '^\s*#' '/etc/dhcpcd.conf'
+fi
+
+# echo "=== Remove IFACE entries from /etc/network/interfaces if any
+# All interfaces configuration should be already separated to /etc/network/interfaces.d/IFACENAME but to be sure"
+# sed -i ":a;N;\$!ba;s/\n\(#[^\n]\+\n\)\?allow-hotplug\s\+${IFACE}\niface\s\+${IFACE}\s[^\n]\+\n\s*wpa-conf\s[^\n]\+//" /etc/network/interfaces
+
+echo "# Wireless interface configured to be Access Point
+auto ${IFACE}
+allow-hotplug ${IFACE}
+iface ${IFACE} inet static
+    metric ${METRIC}
+    address ${IP}
+    netmask ${CIDR}
+" >"/etc/network/interfaces.d/${IFACE}"
+if ((DEBUG)); then
+    echo "=== Current interfaces configuration:"
+    head -n999 /etc/network/interfaces{,.d/*}
+fi
+
+# [[ -f /etc/dnsmasq.conf.dpkg-dist ]] || mv /etc/dnsmasq.conf{,.dpkg-dist}
+next_ip -v IP_START "${IP}"
+ip2dec -v tmp "${NETWORK}"
+# shellcheck disable=SC2154
+dec2ip -v IP_END $((tmp + 2**(32-CIDR) - 2))
+
+read -rd '' DNSMASQ_CONF_CONTENT <<'EOFDNSMASQ_CONF_CONTENT'
+# Autoconfigured via create-ap script. For more options see /etc/dnsmasq.conf.dpkg-dist
+# Also check /etc/dnsmasq.d/* for interface specific setup
+bind-interfaces
+domain-needed
+bogus-priv
+localise-queries
+#server=208.67.222.222
+EOFDNSMASQ_CONF_CONTENT
+if ! [[ -f /etc/dnsmasq.conf ]]; then
+    echo "${DNSMASQ_CONF_CONTENT}" >/etc/dnsmasq.conf
+    ((DEBUG)) && echo '=== Content of /etc/dnsmasq.conf:'$'\n'"${DNSMASQ_CONF_CONTENT}"
+fi
+read -rd '' DNSMASQ_IFACE_CONTENT <<EOFDNSMASQ_IFACE_CONTENT
+interface=${IFACE}
+listen-address=${IP}
+dhcp-range=${IFACE},${IP_START},${IP_END},24h
+#host-record=ap,ap.local,${IP}
+EOFDNSMASQ_IFACE_CONTENT
+echo "${DNSMASQ_IFACE_CONTENT}" >"/etc/dnsmasq.d/${IFACE}"
+((DEBUG)) && echo "=== Content of /etc/dnsmasq.d/${IFACE}:"$'\n'"${DNSMASQ_IFACE_CONTENT}"
+
+# if ! [[ -f /etc/hostapd/hostapd.conf.dpkg-dist ]] && [[ -f /etc/hostapd/hostapd.conf ]]; then
+#     mv /etc/hostapd/hostapd.conf{,.dpkg-dist};
+# fi
+read -rd '' HOSTAPD_CONF_CONTENT <<EOFHOSTAPD_CONF_CONTENT
+# Autoconfigured via create-ap script. For more options see /usr/share/doc/hostapd/examples/hostapd.conf.gz
+interface=${IFACE}
+driver=${HOSTAPD_DRIVER}
+ssid=${SSID}
+#device_name=pi
+#manufacturer=unknown
+country_code=${COUNTRY}
+# Channel autodetection supported only for drivers ath5k, ath9k, ath10k
+#acs_num_scans=5
+#acs_chan_bias=1:0.8 6:0.6 11:0.8
+#channel=acs_survey
+channel=6
+ieee80211n=1
+wmm_enabled=1
+hw_mode=g
+ht_capab=[HT40][SHORT-GI-20][DSSS_CCK-40]
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+${PW_OPT}
+EOFHOSTAPD_CONF_CONTENT
+echo "${HOSTAPD_CONF_CONTENT}" >"${HOSTAPD_CONF}"
+((DEBUG)) && echo "=== Effective content of ${HOSTAPD_CONF}:"$'\n'"${HOSTAPD_CONF_CONTENT}"
+
+((DEBUG)) && echo "=== Enable ${HOSTAPD_CONF} in /etc/default/hostapd"
+sed -i "s|^#\? *DAEMON_CONF=.*|DAEMON_CONF=\"${HOSTAPD_CONF}\"|" /etc/default/hostapd
+systemctl daemon-reload
+
+if ((DEBUG)); then
+    echo '=== Effective content of /etc/default/hostapd:'
+    grep -v -e '^$' -e '^\s*#' /etc/default/hostapd
+fi
+
+echo "=== Up ${IFACE} and start services"
+ifup "${IFACE}"
+systemctl stop hostapd
+sleep 1
+systemctl start hostapd
+# Check if all interfaces exists for dnsmasq binding, othervice it will failed to start.
+HOST_EXISTING_IPS=$(exec -c hostname -I)
+for f in /etc/dnsmasq.d/*; do
+    for e in ${DNSMASQ_IGNORED_EXTS}; do
+        [[ "${f: -${#e}}" == "${e}" ]] && continue 2
+    done
+    f_listen_address=$(exec -c grep -m1 '^listen-address=' "${f}")
+    f_listen_address=${f_listen_address#listen-address=}
+    [[ -z ${f_listen_address} ]] && continue
+    for ip in ${HOST_EXISTING_IPS}; do
+        [[ "${ip}" == "${f_listen_address}" ]] && continue 2
+    done
+    echo "WARNING: Unexisting listen-address ${f_listen_address} specified in ${f}" >&2
+    # rm -f -- "$f"
+    # mv -vfT "${f}" "${f}.dpkg-old"  # dnsmasq will ignore files with ext .dpkg-old (setup in /etc/default/dnsmasq)
+done
+systemctl stop dnsmasq
+sleep 1
+systemctl start dnsmasq
+
+## Setup or disable forwarding
+[[ "${IFACE}" == 'wlan1' ]] && IFACE2='wlan0' || IFACE2='wlan1'
+comment='Setup firewall to allow forwarding from Access Point'
+read -rd '' conf_lines <<EOFCONFLINES
+# ${comment}
+echo 1 >/proc/sys/net/ipv4/ip_forward
+iptables -P FORWARD DROP
+iptables -N FORWARD_AP 2>/dev/null || iptables -F FORWARD_AP
+iptables -A FORWARD_AP -s ${SUBNET} -i ${IFACE} -o eth0 -j ACCEPT
+iptables -A FORWARD_AP -d ${SUBNET} -o ${IFACE} -i eth0 -j ACCEPT
+iptables -A FORWARD_AP -s ${SUBNET} -i ${IFACE} -o ${IFACE2} -j ACCEPT
+iptables -A FORWARD_AP -d ${SUBNET} -o ${IFACE} -i ${IFACE2} -j ACCEPT
+iptables -C FORWARD -j FORWARD_AP 2>/dev/null || iptables -A FORWARD -j FORWARD_AP
+iptables -t nat -N POSTROUTING_AP 2>/dev/null || iptables -t nat -F POSTROUTING_AP
+iptables -t nat -A POSTROUTING_AP -s ${SUBNET} -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING_AP -s ${SUBNET} -o ${IFACE2} -j MASQUERADE
+iptables -t nat -C POSTROUTING -j POSTROUTING_AP 2>/dev/null || iptables -t nat -A POSTROUTING -j POSTROUTING_AP
+# END ${comment}
+EOFCONFLINES
+
+sed -i "/^# ${comment}/,/^# END ${comment}/d" /etc/rc.local  # Remove AP forwarding rules from rc.local
+if ((FORWARDING)); then
+    echo '=== Setup forwarding and add it to /etc/rc.local'
+    eval "${conf_lines}"
+    sed -i -e '1h;2,$H;$!d;g' -e 's/\s*\n\+exit 0\s*//' /etc/rc.local
+    echo $'\n'"${conf_lines}"$'\n''exit 0' >>/etc/rc.local
+else
+    echo '=== Remove existing iptables rules for forwarding if any'
+    if  iptables -C FORWARD -j FORWARD_AP 2>/dev/null; then
+        iptables -D FORWARD -j FORWARD_AP
+        iptables -F FORWARD_AP
+        iptables -X FORWARD_AP
+    fi
+    if  iptables -t nat -C POSTROUTING -j POSTROUTING_AP 2>/dev/null; then
+        iptables -t nat -D POSTROUTING -j POSTROUTING_AP
+        iptables -t nat -F POSTROUTING_AP
+        iptables -t nat -X POSTROUTING_AP
+    fi
+fi
+if ((DEBUG)); then
+    echo '=== Effective content of /etc/rc.local:'
+    grep -v -e '^$' -e '^\s*#' /etc/rc.local
+    echo '=== Current iptables state:'
+    for TBL in raw mangle nat filter; do echo "==${TBL}=="; iptables -vnL -t "${TBL}"; echo; done
+fi
+## END Setup forwarding
+
+echo "=== Access Point creation completed, try it: ${SSID}/${PW::2}***${PW: -2}"
