@@ -1,0 +1,6 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tricolor-led
+
+Files: *
+Copyright: 2020 vmspike
+License: MIT

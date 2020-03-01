@@ -1,0 +1,20 @@
+Source: tricolor-led
+Section: admin
+Priority: optional
+Maintainer: Mikhail Vagin <vmspike@gmail.com>
+Build-Depends: debhelper (>=9)
+Standards-Version: 3.9.6
+Homepage: https://github.com/vmspike/pi-tools/tricolor-led/
+
+Package: tricolor-led
+Architecture: all
+Depends: ${misc:Depends}, bash-builtins (>= 4.4), systemd (>= 232)
+Pre-Depends: bash (>= 4.4), coreutils (>= 8.26)
+Description: Bash script to manage tricolor LED via GPIO sysfs
+ Help to manage tricolor green/red/orange LED using sysfs.
+ Able to set solid colors, blinking sequences, and check LED state.
+ .
+ LED_GPIO1 and LED_GPIO2 environmental variables can be set to replace
+ default GPIO pins: 16 26.
+ .
+ Only "gpio" group members and root can use this tool.

@@ -1,0 +1,20 @@
+# This service is a part of tricolor-led package
+
+[Unit]
+Description=Set LED state on early boot
+DefaultDependencies=false
+After=proc-sys-fs-binfmt_misc.automount
+Requires=proc-sys-fs-binfmt_misc.automount
+Before=basic.target
+ConditionPathExists=/sys/class/gpio/export
+ConditionPathExists=/bin/sh
+
+[Service]
+Type=oneshot
+Restart=no
+# Set to "orange" which is a state of "vague" led alias
+# Cannot use "led" script directly here because it's too early for it.
+ExecStart=/bin/sh -c 'echo 16 >/sys/class/gpio/export; echo 26 >/sys/class/gpio/export; while ! [ -f /sys/class/gpio/gpio16/direction ] || ! [ -f /sys/class/gpio/gpio26/direction ]; do :; done; echo out >/sys/class/gpio/gpio16/direction; echo out >/sys/class/gpio/gpio26/direction; while ! [ -f /sys/class/gpio/gpio16/value ] || ! [ -f /sys/class/gpio/gpio26/value ]; do :; done; echo 1 >/sys/class/gpio/gpio16/value; echo 1 >/sys/class/gpio/gpio26/value'
+
+[Install]
+WantedBy=basic.target

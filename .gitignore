@@ -1,0 +1,24 @@
+# Ignore all files directly in subdirs except some specific, keep only directories
+/*/*
+!/*/*/
+!/*/README.md
+
+# Ignore all directories inside /pkgname-pkgversion/debian/ except some specific
+/*/*/debian/*/
+!/*/*/debian/source/
+!/*/*/debian/patches/
+!/*/*/debian/conf/
+!/*/*/debian/config/
+
+# Ignore some files in /pkgname-pkgversion/debian/
+/*/*/debian/*.debhelper.log
+/*/*/debian/*.debhelper
+/*/*/debian/*.substvars
+/*/*/debian/*.ex
+/*/*/debian/*.EX
+/*/*/debian/debhelper-build-stamp
+/*/*/debian/files
+/*/*/debian/*-stamp
+
+# Ignore deb packages
+*.deb

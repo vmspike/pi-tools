@@ -1,0 +1,686 @@
+#!/bin/bash
+
+##
+# Manage tricolor green/red/orange LED using sysfs.
+#
+# LED_GPIO1 and LED_GPIO2 environmental variables can be set to replace
+# default GPIO pins 16 and 26.
+#
+# Only gpio group members can run this script, so it should have ownership
+# root:gpio and permissions 754 to avoid occasional execution by other users.
+# LED_PIDFILE and LED_SAVEFILE files have to exist and be owned by root:gpio
+# and has permissions 664.
+# LED_KILL_DIR dir have to exist and be owned by root:gpio
+# and has permissions 775.
+# Example of manual filesystem structure creation:
+#   LED_KILL_DIR=/run/tricolor-led/kill
+#   LED_PIDFILE=/run/tricolor-led/led.pid
+#   LED_SAVEFILE=/run/tricolor-led/led.state
+#   mkdir -p "${LED_KILL_DIR}"
+#   : >"${LED_PIDFILE}"
+#   : >"${LED_SAVEFILE}"
+#   chmod 775 "${LED_KILL_DIR}"
+#   chmod 664 "${LED_PIDFILE}" "${LED_SAVEFILE}"
+#   chmod 755 "${LED_KILL_DIR%/*}"
+#   chown -R root:gpio "${LED_KILL_DIR%/*}"
+# To do it automatically you can use tmpfiles.d of systemd or create separate
+# one shot service to launch on boot.
+#
+# For more info run "led man" or "led help".
+##
+
+
+## Variables
+readonly SCRIPT_VERSION='1.0.0'
+
+# TODO: workaround the case when the kill dir and/or pid/save files became readonly or absent unexpectedly
+#readonly LED_KILL_DIR='/opt/tricolor-led/kill'  # No trailing slash
+#readonly LED_PIDFILE='/opt/tricolor-led/led.pid'
+#LED_SAVEFILE='/opt/tricolor-led/led.state'
+#
+# This way will work even if rootfs became readonly, but they have to be
+# recreated on each boot. Recreation can be handled by tmpfiles.d config if
+# systemd is in use.
+readonly LED_KILL_DIR='/run/tricolor-led/kill'  # No trailing slash
+readonly LED_PIDFILE='/run/tricolor-led/led.pid'
+LED_SAVEFILE='/run/tricolor-led/led.state'
+
+# Set default if LED_GPIO[12] does not exists or not a number
+[[ -n "${LED_GPIO1}" && -z "${LED_GPIO1//[0-9]}" ]] || LED_GPIO1=16
+[[ -n "${LED_GPIO2}" && -z "${LED_GPIO2//[0-9]}" ]] || LED_GPIO2=26
+readonly LED_GPIO1 LED_GPIO2
+#export LED_GPIO1 LED_GPIO2
+## END Variables
+
+
+## Aliases
+# LED state aliases
+# Interval have to be a float or int number or exist in BLINK_INTERVAL_ALIASES
+declare -A ALIASES=(
+          [ok]='green'
+    [corefail]='blink fast orange green'
+     [netfail]='blink slow orange off'
+     [upgrade]='blink slow orange green'
+        [boot]='blink fast red orange'
+    [disaster]='blink slow red off'
+       [vague]='orange'
+)
+
+# Blinking interval main aliases
+# All aliases used in ALIASES have to be specified here
+declare -A BLINK_INTERVAL_ALIASES=(
+     [snail]=2
+      [slow]=1
+    [medium]=0.5
+      [fast]=0.25
+    [falcon]=0.125
+)
+
+# Blinking interval alternative short aliases
+declare -A BLINK_INTERVAL_ALIASES_ALT=(
+        [xs]=2
+         [s]=1
+         [m]=0.5
+         [f]=0.25
+        [xf]=0.125
+)
+## END Aliases
+
+
+# Enable builtin 'sleep' if available for more precise timing and to save resources
+enable -f /usr/lib/bash/sleep sleep
+
+
+##
+# Export GPIO on sysfs for the LED if not exported yet.
+# Do nothing if already exported.
+##
+gpio_export() {
+    local tmp1 tmp2
+
+    # Do nothing if export does not required
+    if [[ -r "/sys/class/gpio/gpio${LED_GPIO1}/direction"
+       && -r "/sys/class/gpio/gpio${LED_GPIO2}/direction" ]]; then
+        read -t 1 tmp1 <"/sys/class/gpio/gpio${LED_GPIO1}/direction"
+        read -t 1 tmp2 <"/sys/class/gpio/gpio${LED_GPIO2}/direction"
+        [[ "${tmp1}" == 'out' && "${tmp2}" == 'out' ]] && return 0
+    fi
+
+    # Not exported, let's export
+    [[ -d "/sys/class/gpio/gpio${LED_GPIO1}" ]] || echo "${LED_GPIO1}" >/sys/class/gpio/export;
+    [[ -d "/sys/class/gpio/gpio${LED_GPIO2}" ]] || echo "${LED_GPIO2}" >/sys/class/gpio/export;
+
+    # Give the time for the kernel to apply changes
+    for ((i=0;1;++i)); do
+        if [[ -f "/sys/class/gpio/gpio${LED_GPIO1}/direction"
+           && -f "/sys/class/gpio/gpio${LED_GPIO2}/direction" ]]; then
+            break
+        elif ((i>=24)); then
+            if ! [[ -f "/sys/class/gpio/gpio${LED_GPIO1}/direction" ]]; then
+                echo "Failed to export GPIO pin ${LED_GPIO1}" >&2
+            fi
+            if ! [[ -f "/sys/class/gpio/gpio${LED_GPIO2}/direction" ]]; then
+                echo "Failed to export GPIO pin ${LED_GPIO2}" >&2
+            fi
+            exit 3
+        fi
+        # Smaller than 0.05 seconds sleep values significantly increase CPU usage,
+        sleep 0.05
+    done
+
+    # Force 'out' directions
+    echo out >"/sys/class/gpio/gpio${LED_GPIO1}/direction"
+    echo out >"/sys/class/gpio/gpio${LED_GPIO2}/direction"
+    for ((i=0;1;++i)); do
+        read -t 1 tmp1 <"/sys/class/gpio/gpio${LED_GPIO1}/direction"
+        read -t 1 tmp2 <"/sys/class/gpio/gpio${LED_GPIO2}/direction"
+        if [[ "${tmp1}" == 'out' && "${tmp2}" == 'out' ]]; then
+            return 0
+        elif ((i>=24)); then
+            if [[ "${tmp1}" != 'out' ]]; then
+                echo "Failed to set GPIO pin ${LED_GPIO1} direction to \"out\"" >&2
+            fi
+            if [[ "${tmp2}" != 'out' ]]; then
+                echo "Failed to set GPIO pin ${LED_GPIO2} direction to \"out\"" >&2
+            fi
+            exit 3
+        fi
+        # Smaller than 0.05 seconds sleep values significantly increase CPU usage,
+        sleep 0.05
+    done
+}
+
+
+##
+# Create a flag for existing background blinking process to terminate.
+# Do nothing if there is no background process.
+##
+kill_bg_led() {
+    local oldpid f l
+    if [[ -r "${LED_PIDFILE}" ]]; then
+        read oldpid <"${LED_PIDFILE}"
+        # Try to kill existing process if any, SIGPIPE used to avoid process termination bash message
+        if [[ -n "${oldpid}" ]]; then
+            if [[ -f "/proc/${oldpid}/cmdline" ]]; then
+                read -n 17 l <"/proc/${oldpid}/cmdline"  # -n value here is the length of '/bin/bash-c#blink'
+                if [[ "${l}" == '/bin/bash-c#blink' ]]; then
+                    # Indicate that old process have to stop instead of killing it
+                    : >"${LED_KILL_DIR}/${oldpid}"
+                    if (($?)); then
+                        echo "Unable to create kill file: ${LED_KILL_DIR}/${oldpid}" >&2
+                        exit 2
+                    fi
+                fi
+            fi
+        else  # No PID in pidfile
+            # Process still can be running with empty pidfile in weird cases
+            # which are out of the scope of this script, so let's prefer stability
+            # over speed and check each process.
+
+            # Suppress bash error messages (e.g. when $f became unavailable after loop init)
+            exec 3>&2 2>/dev/null
+
+            for f in /proc/[0-9]*/cmdline; do
+                # Note: it's strange but because of null bytes in cmdline with
+                # 'read -n 18' and '/bin/bash-c#blink ' it doesn't work,
+                # 'read -n 18' return the same as with 'read -n 17'.
+                read -n 17 l <"$f"  # -n value here is the length of '/bin/bash-c#blink'
+                if [[ "${l}" == '/bin/bash-c#blink' ]]; then
+                    oldpid="${f:6: -8}"  # Remove leading '/proc/' and trailing '/cmdline'
+                    # Indicate that old process have to stop instead of killing it
+                    : >"${LED_KILL_DIR}/${oldpid}"
+                    if (($?)); then
+                        echo "Unable to create kill file: ${LED_KILL_DIR}/${oldpid}" >&2
+                        echo "Force kill" >&2
+                        kill "${oldpid}"
+                        if (($?)); then
+                            echo "Failed to force kill for PID: ${oldpid}" >&2
+                            exit 2
+                        else
+                            echo "Successfully killed PID: ${oldpid}" >&2
+                        fi
+                    fi
+                    break  # Should not be more than one active process, so can break here
+                fi
+            done
+
+            # Restore error messages
+            exec 2>&3-
+        fi
+
+        : >"${LED_PIDFILE}"
+        if (($?)); then
+            echo "Unable to truncate PID file: ${LED_PIDFILE}" >&2
+            exit 2
+        fi
+    else
+        echo "Unable to read PID file: ${LED_PIDFILE}" >&2
+        exit 2
+    fi
+}
+
+
+##
+# Output LED state or alias to stdout or file depends on STATE global variable.
+# Globals readonly:
+#   STATE
+#   LED_SAVEFILE
+##
+state_output() {
+    local state blink interval colors key
+    state=$1
+
+    if [[ "${STATE}" == 'alias' ]]; then  # Print alias of the state
+        # Replace interval number to interval alias (if exists) in state
+        read blink interval colors <<<"${state}"
+        if [[ "${blink}" == blink ]]; then
+            for key in "${!BLINK_INTERVAL_ALIASES[@]}"; do
+                if [[ "${BLINK_INTERVAL_ALIASES[${key}]}" == "${interval}" ]]; then
+                    state="${blink} ${key} ${colors}"
+                    break
+                fi
+            done
+        fi
+
+        # Print alias (if found)
+        for key in "${!ALIASES[@]}"; do
+            if [[ "${ALIASES[${key}]}" == "${state}" ]]; then
+                echo "${key}"
+                break
+            fi
+        done
+
+        # Print nothing if alias not found
+        #echo 'CUSTOM'
+    elif [[ "${STATE}" == 'save' ]]; then  # Save state to file
+        echo "${state}" >"${LED_SAVEFILE}"
+        rcode=$?
+        if ((rcode)); then
+            echo 'Failed to save' >&2
+        else
+            echo 'Saved:' >&2
+            echo "${state}"
+        fi
+        return "${rcode}"
+    else  # Print state
+        echo "${state}"
+    fi
+}
+
+
+# Apply the alias if LED state specified as an alias
+if [[ -n $1 ]]; then
+    if [[ -n "${ALIASES[$1]}" ]]; then
+        # shellcheck disable=2086
+        set ${ALIASES[$1]}
+    elif [[ "$1" == solid ]]; then
+        shift  # Allow to run: led solid green
+    fi
+fi
+
+
+## Main case
+case "$1" in
+    green|g|red|r|orange|o|off|0)
+        gpio_export
+        kill_bg_led
+        ;;&  # Continue patterns check
+    green|g)
+        echo 0 >"/sys/class/gpio/gpio${LED_GPIO1}/value"
+        echo 1 >"/sys/class/gpio/gpio${LED_GPIO2}/value"
+        ;;
+    red|r)
+        echo 1 >"/sys/class/gpio/gpio${LED_GPIO1}/value"
+        echo 0 >"/sys/class/gpio/gpio${LED_GPIO2}/value"
+        ;;
+    orange|o)
+        echo 1 >"/sys/class/gpio/gpio${LED_GPIO1}/value"
+        echo 1 >"/sys/class/gpio/gpio${LED_GPIO2}/value"
+        ;;
+    off|0)
+        echo 0 >"/sys/class/gpio/gpio${LED_GPIO1}/value"
+        echo 0 >"/sys/class/gpio/gpio${LED_GPIO2}/value"
+        ;;
+
+    blink|b)
+        ## Validate and prepare blink options
+
+        interval=${2:-0.5}  # Assign default value if interval is not specified
+        # Check and convert interval to non-negative float if required
+        if [[ -n "${BLINK_INTERVAL_ALIASES[${interval}]}" ]]; then
+            interval=${BLINK_INTERVAL_ALIASES[${interval}]}
+        elif [[ -n "${BLINK_INTERVAL_ALIASES_ALT[${interval}]}" ]]; then
+            interval=${BLINK_INTERVAL_ALIASES_ALT[${interval}]}
+        elif [[ "${interval}" =~ ^[0-9]*.?[0-9]+$ ]]; then
+            :  # interval is already non-negative float
+        else
+            echo "Invalid interval: ${interval}" >&2
+            exit 1
+        fi
+
+        # colors=("$@")
+        # colors=("${colors[@]:2}") # Now only colors should be in "${colors[@]}"
+        colors=("${@:3}")
+        [[ -z "${colors[*]}" ]] && colors=(red orange green off)  # Set default colours (optional)
+        # Add 'off' if only one color specified for blinking
+        if ((${#colors[@]} < 2)); then
+            case "${colors[0]}" in
+                ''|off|0) echo "Invalid number of colors for blinking: ${#colors[@]}" >&2; exit 1;;
+                *) colors+=('off');;
+            esac
+        fi
+        # Verify that "${colors[@]}" contain only valid colors and replace short notation to full
+        # It's required for unified output of "color" action
+        for ((i=0;i<${#colors[@]};++i)); do
+            case "${colors[$i]}" in
+                green|red|orange|off) ;;  # Valid colors
+                g) colors[$i]=green;;
+                r) colors[$i]=red;;
+                o) colors[$i]=orange;;
+                0) colors[$i]=off;;
+                *) echo "Invalid color: ${colors[$i]}" >&2; exit 1;;
+            esac
+        done
+
+        ## Generate the code for background blinking process
+        # This comment required to check if it's blinking process and for checking LED state
+        cmd="#blink ${interval} ${colors[*]}"$'\n'
+        # Enable builtin sleep
+        cmd+='enable -f /usr/lib/bash/sleep sleep; '
+        # cmd+='while true; do '
+        cmd+="while [[ -w /sys/class/gpio/gpio${LED_GPIO1}/value ]] && [[ -w /sys/class/gpio/gpio${LED_GPIO2}/value ]]; do "
+        for c in "${colors[@]}"; do
+            case "$c" in
+                green|g)  cmd+="echo 0 >/sys/class/gpio/gpio${LED_GPIO1}/value; echo 1 >/sys/class/gpio/gpio${LED_GPIO2}/value; ";;
+                red|r)    cmd+="echo 1 >/sys/class/gpio/gpio${LED_GPIO1}/value; echo 0 >/sys/class/gpio/gpio${LED_GPIO2}/value; ";;
+                orange|o) cmd+="echo 1 >/sys/class/gpio/gpio${LED_GPIO1}/value; echo 1 >/sys/class/gpio/gpio${LED_GPIO2}/value; ";;
+                off|0)    cmd+="echo 0 >/sys/class/gpio/gpio${LED_GPIO1}/value; echo 0 >/sys/class/gpio/gpio${LED_GPIO2}/value; ";;
+            esac
+            cmd+="sleep ${interval}; "
+            # If kill file created remove it and stop
+            #cmd+="[[ -f ${LED_KILL_DIR}/\$\$ ]] && rm -f ${LED_KILL_DIR}/\$\$ && break; "
+            cmd+="[[ -f \"${LED_KILL_DIR}/\$\$\" ]] && rm -f \"${LED_KILL_DIR}/\$\$\" && break; "
+        done
+        # Finish loop
+        cmd+="done; "
+        # Off color if any
+        # cmd+="[[ -w /sys/class/gpio/gpio${LED_GPIO1}/value ]] && echo 0 >/sys/class/gpio/gpio${LED_GPIO1}/value; [[ -w /sys/class/gpio/gpio${LED_GPIO2}/value ]] && echo 0 >/sys/class/gpio/gpio${LED_GPIO2}/value; "
+
+        gpio_export
+        kill_bg_led
+
+        ## Launch separate process for blinking in background
+        /bin/bash -c "${cmd}" &>/dev/null &
+        echo -n "$!" >"${LED_PIDFILE}"  # Write its pid to the file
+        if (($?)); then
+            echo "Unable to write to PID file: ${LED_PIDFILE}" >&2
+            exit 2
+        fi
+        disown "$!"  # To keep the blinking process alive after parent shell termination
+        ;;
+
+    state|s|alias|a|save)
+        ## Show current LED state or state alias, save existing state, or print nothing and exit
+
+        case "$1" in
+            alias|a) STATE='alias';;
+            save) STATE='save'; [[ -n $2 ]] && LED_SAVEFILE=$2;;
+            *) STATE='state';;
+        esac
+
+        if [[ -r "${LED_PIDFILE}" ]]; then
+            read pid <"${LED_PIDFILE}"
+        else
+            pid=''
+        fi
+        if [[ -n "${pid}" && -f "/proc/${pid}/cmdline" ]]; then
+            read -rd $'\n' l <"/proc/${pid}/cmdline"  # Read till first newline
+            if [[ "${l::17}" == '/bin/bash-c#blink' ]]; then
+                state_output "${l#*#}"  # "${l#*#}" is cmdline comment which contain required info
+                exit $?
+            fi
+        fi
+
+        # Check for running blinking processes in /proc
+        exec 3>&2
+        exec 2>/dev/null
+        for f in /proc/[0-9]*/cmdline; do
+            read -n 17 l <"$f"  # -n value here is the length of '/bin/bash-c#blink'
+            if [[ "${l}" == '/bin/bash-c#blink' ]]; then
+                pid="${f:6: -8}"  # Remove leading '/proc/' and trailing '/cmdline'
+                if ! [[ -f "${LED_KILL_DIR}/${pid}" ]]; then
+                    # This is not process for killing, so it's main blinking process
+                    read -rd $'\n' l <"$f"  # Now read till first newline
+                    state_output "${l#*#}"  # State is in comment on first line
+                    exit $?
+                fi
+            fi
+        done
+        exec 2>&3-
+
+        # No blinking process found
+        if [[ -r "/sys/class/gpio/gpio${LED_GPIO1}/value" ]]; then
+            read -t 1 c1 <"/sys/class/gpio/gpio${LED_GPIO1}/value"
+        else
+            c1=''
+        fi
+        if [[ -r "/sys/class/gpio/gpio${LED_GPIO2}/value" ]]; then
+            read -t 1 c2 <"/sys/class/gpio/gpio${LED_GPIO2}/value"
+        else
+            c2=''
+        fi
+        case "${c1}${c2}" in
+            00) state_output off;;
+            01) state_output green;;
+            10) state_output red;;
+            11) state_output orange;;
+            *) echo 'Failed to check LED state' >&2; exit 1;;
+        esac
+        exit $?
+        ;;
+
+    restore)
+        ## Restore LED state from the file
+        [[ -n $2 ]] && LED_SAVEFILE=$2
+        if ! [[ -f "${LED_SAVEFILE}" ]]; then
+            echo "Save file is not a regular file: ${LED_SAVEFILE}" >&2
+            exit 1
+        fi
+        if ! [[ -r "${LED_SAVEFILE}" ]]; then
+            echo "Save file cannot be read: ${LED_SAVEFILE}" >&2
+            exit 1
+        fi
+        if ! [[ -s "${LED_SAVEFILE}" ]]; then
+            echo "Save file is zero size: ${LED_SAVEFILE}" >&2
+            exit 1
+        fi
+        read -rd '' args <"${LED_SAVEFILE}"
+        # shellcheck disable=2086
+        "$0" ${args}  # Run another script instance with saved state
+        rcode=$?
+        if ((rcode==0)); then
+            echo 'Restored:' >&2
+            echo "${args}"
+        else
+            echo 'Failed to restore' >&2
+        fi
+        exit "${rcode}"
+        ;;
+
+    export|e)
+        gpio_export
+        ;;
+    unexport|u)
+        kill_bg_led
+
+        [[ -d "/sys/class/gpio/gpio${LED_GPIO1}" ]] && echo "${LED_GPIO1}" >/sys/class/gpio/unexport;
+        [[ -d "/sys/class/gpio/gpio${LED_GPIO2}" ]] && echo "${LED_GPIO2}" >/sys/class/gpio/unexport;
+
+        # Wait for unexport to be applied
+        for ((i=0;1;++i)); do
+            if [[ -d "/sys/class/gpio/gpio${LED_GPIO1}"
+               || -d "/sys/class/gpio/gpio${LED_GPIO2}" ]]; then
+                # Smaller than 0.05 seconds sleep values significantly increase CPU usage,
+                sleep 0.05
+            elif ((i>=24)); then
+                if ! [[ -d "/sys/class/gpio/gpio${LED_GPIO1}" ]]; then
+                    echo "Failed to unexport GPIO pin ${LED_GPIO1}" >&2
+                fi
+                if ! [[ -d "/sys/class/gpio/gpio${LED_GPIO2}" ]]; then
+                    echo "Failed to unexport GPIO pin ${LED_GPIO2}" >&2
+                fi
+                exit 3
+            else
+                break
+            fi
+        done
+
+        exit 0
+        ;;
+
+    ''|help|--help|usage|man)
+        read -rd '' USAGE <<'EOFUSAGE'
+DESCRIPTION
+    Help to manage tricolor green/red/orange LED using sysfs.
+    Allow to set solid colors, blinking sequences, and check LED state.
+
+    LED_GPIO1 and LED_GPIO2 environmental variables can be set to replace
+    default GPIO pins: 16 26.
+
+    Only "gpio" group members and root can use this tool.
+
+USAGE
+    led [ACTION] [OPTIONS]
+
+ACTION
+    help, --help, usage, man
+        Print this help.
+        The text outputs to stderr and exit code is 255.
+
+        Action "man" behave a bit differently: try to print using pager
+        ("less" or "more" in most cases) or stdout if no pager. Exit code in
+        this case is equal to pager exit code.
+
+    export, e
+        Export GPIO in sysfs for the LED. In most cases do not need to call it
+        explicitly.
+
+    unexport, u
+        Unexport GPIO for the LED from sysfs. The LED will be switched off in
+        this case.
+
+    [solid] green, g
+    [solid] red, r
+    [solid] orange, o
+    [solid] off, 0
+        Set corresponding solid color. If any blinking process exists it will
+        be preliminary killed. 'solid' argument is optional, will be removed if exists.
+
+    blink [INTERVAL] [COLOR]...
+    b     [INTERVAL] [COLOR]...
+        Run/replace background process with blinking sequence.
+
+        INTERVAL between blink can be set as a float or integer number of
+        seconds or via text alias:
+            snail,  xs: 2
+            slow,    s: 1
+            medium,  m: 0.5
+            fast,    f: 0.25
+            falcon, xf: 0.125
+
+        COLOR is a sequence of colors. See EXAMPLES section for more info.
+
+        If only one color specified 'off' color will be added automatically for blinking.
+        If no colors specified default color sequence will be used: red orange green off
+        If no INTERVAL specified default value will be used: 0.5
+
+    [ALIAS]
+        Example: disaster, ok, netfail, boot, upgrade, vague...
+        LED state aliases for various use cases. Set predefined LED state.
+
+        For other available aliases and specified sequences for them see the
+        dictionary ALIASES in source code. You can customize that dictionary
+        if you wish.
+
+    state, s
+        Check existing LED state. For solid colors it shows full color name,
+        for blinking state show space separated line:
+            blink INTERVAL [COLOR]...
+        where INTERVAL is a float or int number, each of COLOR is a full color
+        name: green, red, orange, off.
+
+        If GPIO sysfs is unexported or LED color check failed it shows
+        nothing and exit with the code 1.
+
+    alias, a
+        Similar to state action but show the state alias (if defined) or
+        nothing if no aliases defined for it.
+
+        Example:
+            Current state is
+                blink 1 red off
+            and ALIASES dictionary has item specified as
+                [disaster]='blink slow red off'
+            and BLINK_INTERVAL_ALIASES has item specified as
+                [slow]=1
+            output will be:
+                disaster
+
+    save [FILE]
+        Save current state to the file.
+        If FILE specified save to that file instead of the default.
+
+        Saved state will be printed to stdout (with prefix line "Saved:" on
+        stderr).
+
+    restore [FILE]
+        Restore LED state from the file. Inverse of "save" action.
+        If FILE specified restore from that file instead of the default.
+
+        Restored state will be printed to stdout (with prefix line "Restored:"
+        on stderr).
+
+    version, --version
+        Show script version and exit.
+
+EXAMPLES
+    - Set solid green (alias: ok)
+        led green
+        led g
+        led ok
+
+    - Check current LED state
+        led state
+        led s
+
+        Output:
+            green
+
+    - Unexport LED on GPIO sysfs
+        led unexport
+        led u
+
+    - Blink fast with red color
+        led blink fast red
+        led b f r
+        led b f r 0
+        led blink 0.25 red off
+
+    - Blink with long sequence with double intervals for some colors
+        led blink medium green red orange orange red green off off
+        led b m g r o o r g 0 0
+
+    - Check state again
+        led s
+
+        Output:
+            blink 0.5 green red orange orange red green off off
+
+        As you can see status output can be reused as arguments for led
+        command.
+
+    - Check existing state and its alias
+        led s && led a
+
+        Output example:
+            blink 0.25 red orange
+            boot
+
+    - Save existing state
+        led save  # To default file
+        led save /path/to/my/fancy/led.state  # To custom file
+
+    - Restore previous LED state
+        led restore  # From default file
+        led restore /path/to/my/fancy/led.state  # From custom file
+
+        Using "restore" action you can implement custom state aliases without
+        code changes:
+            echo 'blink fast g r o 0 o r g 0' >./joy
+            echo 'blink snail o 0' >./slowpoke
+            echo 'orange' >./boring
+            led restore ./slowpoke
+
+        Feel free to add state aliases to ALIASES dictionary if you're able to change the code.
+EOFUSAGE
+        ;;&
+    help|--help|usage)
+        echo "${USAGE}" >&2
+        exit 255
+        ;;
+    man)
+        if hash pager &>/dev/null; then
+            pager <<<"${USAGE}"
+        else
+            echo "${USAGE}"
+        fi
+        exit $?
+        ;;
+
+    --version|version) echo "${SCRIPT_VERSION}";;
+
+    '') echo 'No options specified. For usage run "led man" or "led help".' >&2; exit 1;;
+    *) echo "Invalid option: $1" >&2; exit 1;;
+esac
+
+exit 0

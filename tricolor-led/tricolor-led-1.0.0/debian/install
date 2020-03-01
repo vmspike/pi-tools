@@ -1,0 +1,3 @@
+led opt/tricolor-led
+tricolor-led.conf usr/lib/tmpfiles.d
+led-on-boot.service lib/systemd/system

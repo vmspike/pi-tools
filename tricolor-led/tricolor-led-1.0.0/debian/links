@@ -1,0 +1,5 @@
+opt/tricolor-led/led usr/bin/led
+opt/tricolor-led/led usr/bin/tricolor-led
+run/tricolor-led/led.pid opt/tricolor-led/led.pid
+run/tricolor-led/led.state opt/tricolor-led/led.state
+run/tricolor-led/kill opt/tricolor-led/kill
