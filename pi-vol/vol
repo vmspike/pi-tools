@@ -1,0 +1,88 @@
+#!/bin/bash
+
+##
+# Allow to change PCM volume by quick "vol" command.
+# This script is just a mapping for "amixer" tool.
+#
+# You can choose audio device by VOL_DEVICE environmental variable
+# (default is "PCM").
+#
+# Run without arguments to see inline help.
+##
+
+[[ -z ${VOL_DEVICE} ]] && VOL_DEVICE='PCM'
+arg=${1/%\%}  # Remove trailing % sign if any, because level will be always in %
+
+case "${arg}" in
+    unmute|on|u)
+        exec amixer -q -- set "${VOL_DEVICE}" unmute
+        ;;
+    mute|off|m)
+        exec amixer -q -- set "${VOL_DEVICE}" mute
+        ;;
+    toggle|t)
+        # exec amixer -M -- set "${VOL_DEVICE}" toggle
+        tmp=$(exec -c amixer -- set "${VOL_DEVICE}" toggle)
+        rval=$?
+        tmp=${tmp: -4:3}
+        tmp="${tmp/[}"
+        case "${tmp}" in
+            on|off) echo "${tmp}";;
+            *) echo 'unknown'; rval=100;;
+        esac
+        exit ${rval}
+        ;;
+    status|s)
+        # amixer % here are equal to alsamixer % only if -M specified
+        exec amixer -M -- get "${VOL_DEVICE}"
+        ;;
+    [0-9]|[1-9][0-9]|100)
+        exec amixer -q -M -- set "${VOL_DEVICE}" "${arg}%" unmute
+        ;;
+    +|up|-|down|[+-][0-9]|[+-][1-9][0-9]|[+-]100)
+        case "${arg}" in
+            +|up)   arg='+5';;
+            -|down) arg='-5';;
+        esac
+        # exec amixer -q -M -- set "${VOL_DEVICE}" "${arg:1}%${arg::1}" unmute
+        tmp=$(exec -c amixer -M -- set "${VOL_DEVICE}" "${arg:1}%${arg::1}" unmute)
+        rval=$?
+        tmp=${tmp%\%*}
+        tmp="${tmp##*[}"
+        case "${tmp}" in
+            [0-9]|[1-9][0-9]|100) echo "${tmp}";;
+            *) echo 'unknown'; rval=100;;
+        esac
+        exit ${rval}
+        ;;
+    ''|help|--help)
+        echo -n 'Allows to change PCM volume by quick "vol" command.
+Usage:
+    vol [unmute|on|u]
+        Unmute volume.
+
+    vol [mute|off|m]
+        Mute volume.
+
+    vol [toggle|t]
+        Toggle volume (mute/unmute).
+
+    vol [status|s]
+        Show amixer'\''s status. Use the mapped volume for evaluating the
+        percentage representation like alsamixer, to be more natural for human
+        ear.
+
+    vol [+-]VALUE[%]
+        Set volume level to VALUE and unmute.
+        "%" sign is optional, VALUE is always percentage.
+        If leading "+" or "-" specified volume will be incremented or
+        decremented correspondingly and resulting value will be printed to
+        stdout.
+
+    vol [+|up|-|down]
+        Just an alias for previous command with VALUE=5.
+' >&2
+        exit 255
+        ;;
+    *) echo "Invalid argument: ${arg}" >&2; exit 1;;
+esac
