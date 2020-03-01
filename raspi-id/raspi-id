@@ -1,0 +1,216 @@
+#!/bin/bash
+
+##
+# This script shows Raspberry Pi unique ID's (with additional verifications):
+# - CPU serial
+# - embedded MAC addresses (Ethernet and Wireless).
+#
+# If -r or --raw option specified output will be without name prefixes.
+#
+# By default Ethernet MAC calculated from Raspberry Pi Foundation registered
+# MAC prefix (b8:27:eb:) and CPU serial number, but you can force Ethernet MAC
+# check by -f or --force-ethernet-check option, in this case "ethtool"
+# required to get real Ethernet MAC.
+#
+# It's generally recommended to have "ethtool" because sometimes real wireless
+# MAC address cannot be identified via sysfs.
+#
+# Exit codes:
+# - 0: success (all values correct for sure)
+# - 2: error (some values are incorrect for sure)
+# - 127: invalid options
+# - 128: warning (some values are not trusted, can be valid but can be invalid as well)
+# - *: unknown - script failure (should never occur)
+#
+# Single line alternatives without additional checks assuming that embedded
+# interfaces are eth0 and wlan0 and MAC addresses was not changed:
+#     echo -n 'CPU serial:   '; cat /proc/device-tree/serial-number; echo -n $'\n''Ethernet MAC: '; cat /sys/class/net/eth0/address; echo -n 'Wireless MAC: '; cat /sys/class/net/wlan0/address
+#     echo "CPU serial:   $(read c </proc/device-tree/serial-number; echo $c)"$'\n'"Ethernet MAC: $(</sys/class/net/eth0/address)"$'\n'"Wireless MAC: $(</sys/class/net/wlan0/address)"
+##
+
+
+LC_ALL=C
+shopt -s nullglob
+
+
+## Raspberry Pi Foundation registered MAC prefix: http://standards-oui.ieee.org/oui.txt
+readonly RPi_MAC_PREFIX='b8:27:eb:'
+
+## Sysfs dirs (with trailing slash)
+readonly SYSFS_USB1_NET_DIR='/sys/devices/platform/soc/3f980000.usb/usb1/1-1/1-1.1/1-1.1:1.0/net/'
+readonly SYSFS_MMC1_80211_DIR='/sys/devices/platform/soc/3f300000.mmc/mmc_host/mmc1/mmc1:0001/mmc1:0001:1/ieee80211/'
+
+
+## Check if ethtool exists (required to get real hardware MAC address in some cases)
+hash ethtool 2>/dev/null && ETHTOOL=1 || ETHTOOL=0
+
+
+## Be sure that this variables are unset
+unset MAC_E MAC_W CPU_S
+
+
+## Parse options
+RAW=0
+FORCE_ETHERNET_CHECK=0
+if [[ -n "$*" ]]; then
+    for o in "$@"; do
+        case "${o}" in
+            -r|--raw) RAW=1;;
+            -f|--force-ethernet-check) FORCE_ETHERNET_CHECK=1;;
+            -fr|-rf) FORCE_ETHERNET_CHECK=1; RAW=1;;
+            *) echo "ERROR: Invalid option: ${o}" >&2; exit 127;;
+        esac
+    done
+fi
+
+
+## Get CPU serial
+if [[ -f /proc/device-tree/serial-number ]]; then
+    read CPU_S </proc/device-tree/serial-number
+elif [[ -f /proc/cpuinfo ]]; then
+    while read n s v; do
+        if [[ "${n}" == 'Serial' && "${s}" == ':' ]]; then
+            CPU_S=${v}
+            break
+        fi
+    done </proc/cpuinfo
+else
+    echo 'WARNING: Cannot get CPU serial number from procfs' >&2
+    rval=128
+fi
+
+
+if ((FORCE_ETHERNET_CHECK)) || [[ -z "${CPU_S}" ]]; then
+    ## Get Ethernet MAC
+    IFACE_E=()
+    for iface in "${SYSFS_USB1_NET_DIR}"*; do
+        iface=${iface##*/}
+        IFACE_E+=("${iface}")
+    done
+    if ((${#IFACE_E[@]} >= 2)); then
+        echo "WARNING: Multiple Ethernet interfaces found on first USB bus [${IFACE_E[*]}], only first one will be checked." >&2
+        rval=128
+    elif ((${#IFACE_E[@]} != 1)); then
+        echo 'WARNING: No Ethernet interfaces found on first USB bus, eth0 will be used as a default.' >&2
+        IFACE_E='eth0'
+        rval=128
+    fi
+    if ((ETHTOOL)); then
+        MAC_E=$(exec -c ethtool -P "${IFACE_E}" 2>/dev/null)
+        MAC_E=${MAC_E##* }
+    else
+        echo 'WARNING: ethtool not found: cannot check Ethernet permanent MAC address, MAC value can be invalid if changed manually.' >&2
+        rval=128
+        [[ -f "/sys/class/net/${IFACE_E}/address" ]] && read MAC_E <"/sys/class/net/${IFACE_E}/address"
+    fi
+else
+    ## Calculate Ethernet MAC from RPi_MAC_PREFIX and CPU_S
+    MAC_E="${RPi_MAC_PREFIX}${CPU_S: -6:2}:${CPU_S: -4:2}:${CPU_S: -2:2}"
+fi
+
+
+## Get Wireless MAC
+IFACE_W_PHY=()
+for iface in "${SYSFS_MMC1_80211_DIR}"*; do
+    iface=${iface##*/}
+    IFACE_W_PHY+=("${iface}")
+done
+if ((${#IFACE_W_PHY[@]} >= 2)); then
+    echo "WARNING: Multiple wireless interfaces found on mmc1 [${IFACE_W_PHY[*]}], only first one will be checked." >&2
+    rval=128
+elif ((${#IFACE_W_PHY[@]} != 1)); then
+    echo 'WARNING: No physical wireless interfaces found on mmc1, use phy0 as a default.' >&2
+    IFACE_W_PHY='phy0'
+    rval=128
+fi
+if [[ -f "${SYSFS_MMC1_80211_DIR}${IFACE_W_PHY}/macaddress" ]]; then
+    read MAC_W <"${SYSFS_MMC1_80211_DIR}${IFACE_W_PHY}/macaddress"
+else
+    echo "WARNING: Failed to detect real MAC address of ${IFACE_W_PHY}, use wlan0 as a default network interface name." >&2
+    rval=128
+    IFACE_W='wlan0'
+    if ((ETHTOOL)); then
+        MAC_W=$(exec -c ethtool -P "${IFACE_W}" 2>/dev/null)
+        MAC_W=${MAC_W##* }
+    else
+        echo 'WARNING: ethtool not found: cannot check Wireless permanent MAC address, MAC value can be invalid if changed manually.' >&2
+        rval=128
+        [[ -f "/sys/class/net/${IFACE_W}/address" ]] && read MAC_W <"/sys/class/net/${IFACE_W}/address"
+    fi
+fi
+
+
+# if ! [[ "${#CPU_S}" == 16
+#         && "${MAC_E::9}" == "${RPi_MAC_PREFIX}"
+#         && "${MAC_W::9}" == "${RPi_MAC_PREFIX}"
+#         && "${CPU_S: -6}" == "${MAC_E:9:2}${MAC_E:12:2}${MAC_E:15:2}"
+#     ]]; then
+#     # Autodetect embedded Ethernet and Wireless interfaces because they are
+#     # probably NOT eth0 and wlan0 correspondingly
+#     unset MAC_E MAC_W
+#     for piface in /sys/class/net/*; do
+#         [[ "${piface}" == '/sys/class/net/lo' ]] && continue
+#         read MAC <"${piface}/address"
+#         [[ "${MAC::9}" != "${RPi_MAC_PREFIX}" ]] && continue
+#         # Here MAC is for embedded interface for sure (if not applied manually)
+#         read -rd '' uevent <"${piface}/uevent"
+#         if [[ -n "${uevent}" && -z "${uevent##*DEVTYPE=wlan*}" ]]; then
+#             # DEVTYPE=wlan exists in uevent file
+#             MAC_W=${MAC}
+#         else
+#             MAC_E=${MAC}
+#         fi
+#     done
+# fi
+
+
+## Show what have been found in all cases
+# case "$1" in
+#     -r|--raw) echo "${CPU_S}"$'\n'"${MAC_E}"$'\n'"${MAC_W}";;
+#     *) echo "CPU serial:   ${CPU_S}"$'\n'"Ethernet MAC: ${MAC_E}"$'\n'"Wireless MAC: ${MAC_W}";;
+# esac
+if ((RAW)); then IFS= read -rd '' OUT <<EOFOUT
+${CPU_S}
+${MAC_E}
+${MAC_W}
+EOFOUT
+else IFS= read -rd '' OUT <<EOFOUT
+CPU serial:   ${CPU_S}
+Ethernet MAC: ${MAC_E}
+Wireless MAC: ${MAC_W}
+EOFOUT
+fi
+echo -n "${OUT}"
+
+
+## Show errors for invalid values
+if [[ -z "${CPU_S}" ]]; then
+    echo 'ERROR: CPU serial number not found' >&2
+    rval=2
+fi
+if ! [[ "${CPU_S}" =~ ^[0-9a-f]{16}$ ]]; then
+    echo 'ERROR: Invalid CPU serial' >&2
+    rval=2
+fi
+if [[ -z "${MAC_E}" ]]; then
+    echo 'ERROR: Ethernet MAC address not found' >&2
+    rval=2
+elif [[ "${MAC_E::9}" != "${RPi_MAC_PREFIX}" ]]; then
+    echo "ERROR: Ethernet MAC address do not match Raspberry Pi Foundation registered prefix: ${RPi_MAC_PREFIX}" >&2
+    rval=2
+fi
+if [[ -z "${MAC_W}" ]]; then
+    echo 'ERROR: Wireless MAC address not found' >&2
+    rval=2
+elif [[ "${MAC_W::9}" != "${RPi_MAC_PREFIX}" ]]; then
+    echo "ERROR: Wireless MAC address do not match Raspberry Pi Foundation registered prefix: ${RPi_MAC_PREFIX}" >&2
+    rval=2
+fi
+if [[ "${FORCE_ETHERNET_CHECK}" == 1 && -n "${CPU_S}" && -n "${MAC_E}" && "${CPU_S: -6}" != "${MAC_E:9:2}${MAC_E:12:2}${MAC_E:15:2}" ]]; then
+    echo "ERROR: Relationship between CPU serial number and Ethernet MAC address is invalid: \"${CPU_S: -6}\" not equal to \"${MAC_E:9:2}${MAC_E:12:2}${MAC_E:15:2}\"" >&2
+    rval=2
+fi
+
+
+## Exit with specified exit code
+exit "${rval:-0}"
