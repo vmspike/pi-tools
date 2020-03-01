@@ -2,6 +2,7 @@
 /*/*
 !/*/*/
 !/*/README.md
+!/show-temperature/**
 
 # Ignore all directories inside /pkgname-pkgversion/debian/ except some specific
 /*/*/debian/*/

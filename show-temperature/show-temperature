@@ -1,0 +1,32 @@
+#!/bin/bash
+
+##
+# This script shows temperature from builtin sensors on Raspberry Pi or some other pi's.
+# Without arguments show CPU and GPU values in human readable format.
+# If -r or --raw specified, show raw CPU temperature in 0.001 °C units.
+##
+
+read CPU <'/sys/class/thermal/thermal_zone0/temp'
+if [[ -z "${CPU}" ]]; then
+    echo "ERROR: Failed to check CPU temperature via sysfs" >&2
+    exit 2
+else
+    case "$1" in
+        '') ;;
+        -r|--raw) echo "${CPU}"; exit 0;;
+        *) echo "ERROR: Unknown option: $1" >&2; exit 1;;
+    esac
+    CPU=${CPU:: -3}.${CPU: -3}
+    echo "CPU: ${CPU} °C"
+fi
+if [[ -x /opt/vc/bin/vcgencmd ]]; then
+    GPU=$(exec -c /opt/vc/bin/vcgencmd measure_temp)
+    GPU=${GPU#temp=}
+    GPU=${GPU%\'C}
+    echo "GPU: ${GPU} °C"
+else
+    echo 'WARNING: Failed to check GPU temperature: /opt/vc/bin/vcgencmd not found' >&2
+    exit 128
+fi
+
+exit 0
