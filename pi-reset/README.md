@@ -3,14 +3,14 @@
 This script resets host to factory state.
 Effectively it self-reflash SD card of live system from compressed disk image pack downloaded from the web.
 
-All log messages (except arguments parsing) brodcasted to all live terminals on the system as well as LOG if possible.
+All log messages (except arguments parsing) broadcasted to all live terminals on the system as well as LOG if possible.
 On failure result information written to STATUS_LOG.
 
 The whole process may take 20 minutes approximately, on slow connections can take much more.
 
 If you have tricolor LED attached to the host (or two single color LEDs) and tricolor-led package installed you can monitor the script stages.
 
-There're three of them:
+There are three of them:
 - Preparatory: red<->orange ~2 times per second (interruption is relatively safe,
   like usual power loss)
 - Intermediate: solid orange (should take not more than a few seconds)
@@ -41,7 +41,7 @@ Commandline options:
         additional binaries will be available on ramdisk (coreutils, libs and others)
         so final rootfs will consume more RAM.
         Some low RAM hosts or big images may be unable to reset with this option.
-        Approximatelly the image pack compressed by xz should be less than RAM size minus ~100MB.
+        Approximately the image pack compressed by xz should be less than RAM size minus ~100MB.
 
     --allow-unverified-https 0|1
         If 1 ignore TLS cert for image downloading. It forces to use --no-check-certificate wget option.

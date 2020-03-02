@@ -4,11 +4,11 @@ This script shows Raspberry Pi unique ID's (with additional verifications):
 - CPU serial
 - embedded MAC addresses (Ethernet and Wireless).
 
-If -r or --raw option specified output will be without name prefixes.
+If `-r` or `--raw` option specified output will be without name prefixes.
 
 By default Ethernet MAC calculated from Raspberry Pi Foundation registered
 MAC prefix (b8:27:eb:) and CPU serial number, but you can force Ethernet MAC
-check by -f or --force-ethernet-check option, in this case "ethtool"
+check by `-f` or `--force-ethernet-check` option, in this case "ethtool"
 required to get real Ethernet MAC.
 
 It's generally recommended to have "ethtool" because sometimes real wireless

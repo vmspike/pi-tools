@@ -1,6 +1,6 @@
 # tricolor-led
 
-Bash "led" script which manage tricolor green/red/orange LED using sysfs.
+Bash `led` script which manage tricolor green/red/orange LED using sysfs.
 
 This is deb package sources.
 For prebuilt package see https://vmspike.com/repo/pi-tools/tricolor-led/
@@ -17,7 +17,7 @@ To build deb package:
 - run `cd ./` to apply changed PWD (if dch have renamed current dir)
 - Build the package: `debuild -uc -us -b`, if all is fine you'll find it in parent dir `../`
 
-Output of "led man":
+Output of `led man`:
 ```
 DESCRIPTION
     Help to manage tricolor green/red/orange LED using sysfs.
