@@ -1,0 +1,517 @@
+#!/bin/bash
+
+##
+# This script resets host to factory state.
+# Effectively it self-reflash SD card of live system from compressed disk image pack downloaded from the web.
+#
+# All log messages (except arguments parsing) brodcasted to all live terminals on the system
+# as well as LOG if possible.
+# On failure result information written to STATUS_LOG.
+#
+# The whole process may take 20 minutes approximately, on slow connections can take much more.
+#
+# If you have tricolor LED attached to the host (or two single color LEDs) and
+# tricolor-led package installed you can monitor the script stages.
+# There're three of them:
+# - Preparatory: red<->orange ~2 times per second (interruption is relatively safe,
+#   like usual power loss)
+# - Intermediate: solid orange (should take not more than a few seconds)
+# - Flashing: red<->green ~4 times per second (interruption will cause SD card corruption,
+#   you'll need to reflash SD manually!)
+#
+# Custom options will be loaded from config file if present. See script defaults for the syntax
+# Options priority: commandline options > config options > script defaults
+#
+# Commandline options:
+#     --config str
+#         Must be the first argument if specified!
+#         Options from config file overrides script defaults.
+#         Default is /etc/pi-config.conf
+#
+#     --dry-run 0|1
+#         If 1 do all the same except real flashing, instead unpack and flash to /dev/null
+#         Can be useful for testing purposes.
+#
+#     --tricolor-led 0|1
+#         Report device state by changing tricolor LED state if tricolor LED attached to the host
+#         and "led" utility exists.
+#
+#     --keep-ssh 0|1
+#         If enabled SSH connection will be preserved as long as possible and
+#         additional binaries will be available on ramdisk (coreutils, libs and others)
+#         so final rootfs will consume more RAM.
+#         Some low RAM hosts or big images may be unable to reset with this option.
+#         Approximatelly the image pack compressed by xz should be less than RAM size minus ~100MB.
+#
+#     --allow-unverified-https 0|1
+#         If 1 ignore TLS cert for image downloading. It forces to use --no-check-certificate wget option.
+#
+#     --img-url str
+#         Now it must be tar.xz (or txz) archive. Others are unsupported.
+#
+#     --ram-disk-size int
+#         The size of RAM disk to create in bytes. Suffixes allowed: K M %
+#         Default is 90% of total RAM.
+#
+#     --sdcard-device str
+#         The device to be flashed.
+#         Default is /dev/mmcblk0
+#
+# TODO:
+# - Current script state is unstable, thorough testing required.
+# - Use busybox for ramdisk filesystem, because the way using existing system binaries is unstable.
+##
+
+
+## Defaults
+readonly VERSION='0.3'  # Script version
+LC_ALL=C  # To avoid locale issues
+TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
+LOG='/var/log/pi-reset.log'
+STATUS_LOG='/var/log/pi-reset-status.log'
+KEEP_NETWORK=1
+KEEP_SSH=0
+ALLOW_UNVERIFIED_HTTPS=0
+IMG_URL=''  # Empty to autogenerate. See generation template below
+TRICOLOR_LED=0  # If tricolor LED attached to the host and "led" utility exists
+SDCARD_DEVICE='/dev/mmcblk0'  # TODO: autodetect by default.
+DRY_RUN=0
+
+# Get total RAM in bytes.
+# E.g. on Raspberry Pi 3 Model B can be up to 1018089472 bytes depends on reserved RAM for GPU.
+RAM_TOTAL=$(($(exec -c grep -om1 '[0-9]*' </proc/meminfo)*1024))
+RAM_DISK_SIZE='90%'  # In bytes or % of total RAM available. Suffixes KM% allowed
+RAM_DISK_MOUNTPOINT='/tmp/tmproot'
+
+CONFIG='/etc/pi-reset.conf'
+## END Defaults
+
+# Read CONFIG from commandline args if specified as a first argument
+if [[ "$1" == '--config' ]] && [[ -n $2 ]]; then
+    CONFIG="$2"
+    shift 2
+fi
+
+# Import variables from config if present and readable.
+# They overwrites default variables.
+[[ -r "${CONFIG}" ]] && . "${CONFIG}"
+
+
+## Parse arguments
+# Commandline args overwrites both default and config options
+ARGS=("$@")  # Clone command line arguments to access them via array indexes
+# shellcheck disable=SC2031
+for ((i=0;i<${#ARGS[@]};i++)); do
+    case "${ARGS[$i]}" in
+        --dry-run) DRY_RUN=${ARGS[$((++i))]};;
+        --tricolor-led) TRICOLOR_LED=${ARGS[$((++i))]};;
+        --keep-ssh) KEEP_SSH=${ARGS[$((++i))]};;
+        --keep-network) KEEP_NETWORK=${ARGS[$((++i))]};;
+        --allow-unverified-https) ALLOW_UNVERIFIED_HTTPS=${ARGS[$((++i))]};;
+        --img-url) IMG_URL=${ARGS[$((++i))]};;
+        --ram-disk-size) RAM_DISK_SIZE=${ARGS[$((++i))]};;
+        --sdcard-device) SDCARD_DEVICE=${ARGS[$((++i))]};;
+        --config)
+            echo 'ERROR: --config option can be specified only as a first argument' >&2
+            exit 1
+            ;;
+        *)  echo "ERROR: Invalid option: ${ARGS[$i]}" >&2
+            exit 1
+    esac
+done
+## END Parse arguments
+
+
+# Be sure log files exists
+mkdir -p "${LOG%/*}"  # Make sure that the dir for LOG exists
+: >>"${LOG}"
+mkdir -p "${STATUS_LOG%/*}"  # Make sure that the dir for STATUS_LOG exists
+: >>"${STATUS_LOG}"
+
+# Redirect all unexpected output to the log
+exec >>"${LOG}" 2>&1
+
+# Enable SysRq
+echo 1 >/proc/sys/kernel/sysrq
+
+## Validate/transform variables
+for o in KEEP_NETWORK KEEP_SSH DRY_RUN TRICOLOR_LED; do
+    # Convert to boolean
+    case "${!o,,}" in
+        1|y|yes|true) printf -v "${o}" '%s' 1;;
+        0|n|no|false) printf -v "${o}" '%s' 0;;
+        *)  echo "ERROR: Invalid value for option ${o}: ${!o}" >&2
+            exit 1
+    esac
+done
+
+if ! [[ -b "${SDCARD_DEVICE}" ]]; then
+    echo "ERROR: SDCARD_DEVICE does not exists or not a block special device: ${SDCARD_DEVICE}" >&2
+    exit 1
+fi
+
+((ALLOW_UNVERIFIED_HTTPS)) && CHECK_CERT='--no-check-certificate' || CHECK_CERT=''
+((DRY_RUN)) && SDCARD_DEVICE='/dev/null'
+
+if ((KEEP_SSH && ! KEEP_NETWORK)); then
+    echo 'WARNING: Forcing KEEP_NETWORK=1 because of KEEP_SSH=1' >&2
+    KEEP_NETWORK=1
+fi
+
+if [[ -z ${IMG_URL} ]]; then
+    echo "ERROR: IMG_URL is required" >&2
+    exit 1
+elif ! wget ${CHECK_CERT} -q --spider "${IMG_URL}"; then
+    echo "ERROR: Image url is unavailable: ${IMG_URL}" >&2
+    exit 2
+fi
+
+if ((TRICOLOR_LED)) && ! hash led 2>/dev/null; then
+    echo 'WARNING: TRICOLOR_LED is enabled but "led" script not found. Disabling LED functionality.' >&2
+    TRICOLOR_LED=0
+fi
+
+if ! [[ "${RAM_DISK_SIZE}" =~ ^[1-9][0-9]*[KM%]?$ ]]; then
+    echo "ERROR: Invalid value for option RAM_DISK_SIZE: ${RAM_DISK_SIZE}" >&2
+    exit 1
+fi
+## END Validate/transform variables
+
+
+## Functions
+##
+# Send message to all terminals and to LOG file if possible.
+# Finally sync filesystem to be sure that log entry is saved.
+##
+log (){
+    # echo "$@" >&2
+    # bwall "$*"
+    /usr/bin/wall -nt2 -- "$@"
+    if [[ -w "${LOG}" ]]; then
+        printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ "$*" >>"${LOG}"
+        # To be sure that this log line saved if anything will go wrong
+        /bin/sync &>/dev/null || echo s >/proc/sysrq-trigger
+    fi
+}
+
+##
+# Sync and hard reboot via sysrq
+##
+sysrq_reboot (){
+    # Enable SysRq
+    echo 1 >/proc/sys/kernel/sysrq
+    # Attempt to sync all filesystems. Give time to sync if done by sysrq
+    /bin/sync &>/dev/null || { echo s >/proc/sysrq-trigger && /bin/sleep 1 &>/dev/null; }
+    # Immediately reboot without syncing or fs unmounting
+    echo b >/proc/sysrq-trigger
+    /bin/sleep 5 &>/dev/null  # To be sure OS have time to reboot
+}
+
+##
+# Function that emulate `wall` command line util to send broadcast messages.
+# Specifically allow to not send leading and trailing newlines.
+##
+# bwall (){
+#     [[ -z "${PTTY_DEVICE}" ]] && export PTTY_DEVICE='/dev/pts/'
+#     [[ -z "${TTY_DEVICE}" ]] && export TTY_DEVICE='/dev/tty'
+#     [[ -z "${MAX_TTY_ID}" ]] && export MAX_TTY_ID=63
+#
+#     # Temp files
+#     export tmpFile=$(exec -c mktemp);
+#     export tmpFile2=$(exec -c mktemp);
+#     export tmpFile_tty=$(exec -c mktemp);
+#
+#     tty >"${tmpFile_tty}" 2>/dev/null
+#
+#     # Read the stdin for the data
+#     if [[ -z "$1" ]]; then
+#         # Read the stdin for the data
+#         tee -- "${tmpFile}" &>/dev/null
+#     else
+#         # Read the first parameter for the data
+#         echo -n "$1" | tee -- "${tmpFile}" &>/dev/null
+#     fi
+#
+#     # Make the message
+#     cat >"${tmpFile2}" <<EOD
+#
+# Broadcasted message from ${USER}@`cat -- /etc/hostname | tr -d '\n'`
+#         ($tmpFile_tty) at `date +'%Y/%m/%d %H:%M:%S'`
+#
+# `cat -- "$tmpFile"`
+# EOD
+#
+#     # Send the message to all PTTY_DEVICE
+#     for i in $(seq 1 $MAX_TTY_ID); do
+#         cat -- "${tmpFile2}" | tee -- "${PTTY_DEVICE}${i}" &>/dev/null
+#     done
+#     # Send the message to all TTY_DEVICE
+#     for i in $(seq 1 $MAX_TTY_ID); do
+#         cat -- "${tmpFile2}" | tee -- "${TTY_DEVICE}${i}" &>/dev/null
+#     done
+#
+#     # Remove old files
+#     rm -f -- "${tmpFile}" "${tmpFile2}"
+# }
+## END Functions
+
+printf -v ts "%(${TIMESTAMP_FORMAT})T" '-1'
+log "Broadcast messages below from ${USER}@${HOSTNAME} (${ts})"
+log 'Start full factory reset and SD card image reflash'
+
+# Analogue of `disown` but from inside the script and affect wider range of signals
+log 'Ignore some signals to avoid termination'
+trap '' SIGHUP SIGTERM SIGINT SIGQUIT SIGTTIN SIGTTOU SIGTSTP
+
+if ((TRICOLOR_LED)); then
+    log 'Preparatory stage: Change LED blinking appearance to red<->orange 2Hz'
+    led blink 0.5 red orange
+else
+    log 'Preparatory stage'
+fi
+
+## Workaround for lost internet access if several interfaces with default route is up but preferred one has no connection, e.g. eth0 without carrier or DHCP settings request failed.
+# Increase metric for default route of eth0 with no-carrier
+read -rd '' carrier_state </sys/class/net/eth0/carrier
+if [[ "${carrier_state}" != 1 ]]; then  # No carrier or iface down or not configured
+    c=$(exec -c ip route show match 0.0.0.0 dev eth0)
+    c="${c% metric *} dev eth0 metric 9999"
+    ip route del default dev eth0
+    # shellcheck disable=SC2086
+    ip route add $c
+fi
+
+
+log 'The content of SD card will be overwritten by the new image and OS finally reboots. Do not interrupt/poweroff in the middle of image flashing (when execution will reach flashing stage)!'
+if ((KEEP_SSH)); then
+    log 'Stop all systemd services except getty, networking, and ssh'
+    for service in $(systemctl list-units --state=running --no-legend --no-pager | cut -d' ' -f1 | grep -v -e '^wpa_supplicant\.service' -e '^ssh\.service' -e '^networking\.service' -e '^session.*\.scope' -e '^init\.scope' | sort -r); do timeout -k 5 5 systemctl stop "${service}"; done
+elif ((KEEP_NETWORK)); then
+    log 'Stop all systemd services except getty and networking'
+    for service in $(systemctl list-units --state=running --no-legend --no-pager | cut -d' ' -f1 | grep -v -e '^wpa_supplicant\.service' -e '^networking\.service' -e '^getty@.*\.service' -e '^session.*\.scope' -e '^init\.scope' | sort -r); do timeout -k 5 5 systemctl stop "${service}"; done
+else
+    log 'Stop all systemd services except getty'
+    for service in $(systemctl list-units --state=running --no-legend --no-pager | cut -d' ' -f1 | grep -v -e '^getty@.*\.service' -e '^session.*\.scope' -e '^init\.scope' | sort -r); do timeout -k 5 5 systemctl stop "${service}"; done
+fi
+
+log 'Disable swap'
+swapoff -a
+
+log 'Unmount all unused filesystems (some will be busy)'
+umount -a 2>&1 | grep -v -e 'In some cases useful info about processes that' -e 'use the device is found by lsof(8) or fuser(1).' >&2
+mount -o remount,rw /  # To be sure that it's rw
+
+log 'Create RAM disk for new rootfs'
+mkdir -p "${RAM_DISK_MOUNTPOINT}"
+mount -t tmpfs -o rw,size="${RAM_DISK_SIZE}" none "${RAM_DISK_MOUNTPOINT}"
+
+log 'Create bare minimal rootfs in RAM'
+# TODO: minimize tmproot size (libs takes most space)
+mkdir "${RAM_DISK_MOUNTPOINT}"/{dev,proc,sys,run,usr,var,tmp,oldroot}
+# List with dirs/files to create new rootfs with
+LST='
+/bin/{bash,dd,fuser,mount,systemctl,systemd,tar,umount,sleep,findmnt,hostname,sync}
+/sbin/{init,reboot}
+/etc/{default,ld.so.conf.d,ca-certificates*,group,gshadow,init,init.d,passwd,rc*.d,rcS.d,shadow,systemd}
+/usr/lib/{tar,coreutils,arm-linux-gnueabihf/coreutils,systemd,arm-linux-gnueabihf/lib{nettle,gnutls,psl,idn,p11,tasn1,hogweed,gmp,icuuc,ffi,icudata,stdc,lz4,unistring}*}
+/usr/bin/{wget,xz,wall,led}
+/opt/tricolor-led
+/lib/{arm-linux-gnueabihf,ld-linux*,lsb,systemd,init}
+/var/{run,lock}
+/var/lib/systemd
+'
+# LST+='/usr/lib/lib{lwres,bind9,dns,isccfg,isc}* '  # DEBUG
+if ((KEEP_SSH)); then
+    # SSH specific dirs/files + coreutils + handy utils for debugging
+    LST+='
+    /etc/{pam.conf,pam.d,hosts,ssh,sudoers*,ssl,security,selinux,request-key.d}
+    /usr/lib/{arm-linux-gnueabihf/{*.so*,openssl*},sudo,locale/locale-archive}
+    /usr/bin/{sudo,ssh,openssl}
+    /usr/sbin/sshd
+
+    /bin/{cat,chgrp,chmod,chown,cp,date,dd,df,dir,echo,false,ln,ls,mkdir,mknod,mktemp,mv,pwd,readlink,rm,rmdir,sleep,stty,touch,true,uname,vdir,ps}
+    /usr/bin/{[,arch,base64,basename,chcon,cksum,comm,csplit,cut,dircolors,dirname,du,env,expand,expr,factor,fmt,fold,groups,head,hostid,id,install,join,link,logname,md5sum,md5sum.textutils,mkfifo,nice,nl,nohup,nproc,numfmt,od,paste,pathchk,pinky,pr,printenv,printf,ptx,realpath,runcon,seq,sha1sum,sha224sum,sha256sum,sha384sum,sha512sum,shred,shuf,sort,split,stat,stdbuf,sum,tac,tail,tee,test,timeout,touch,tr,truncate,tsort,tty,unexpand,uniq,unlink,users,wc,who,whoami,yes}
+    /usr/sbin/chroot
+
+    /sbin/{pivot_root,ip}
+    /bin/{ps,nano,grep}
+    /usr/bin/{free,less,find}
+    /usr/lib/lib*.so*
+    '
+fi
+## For more featured rootfs use instead:
+# LST+='/sbin /bin /usr/bin /usr/lib/lib*.so* '  # DEBUG
+## For even more use instead:
+# LST='/{bin,etc,sbin,lib} /usr/{bin,sbin,lib} /var/{lib,lock,run} '  # DEBUG
+
+# Evaluate LST
+LST="${LST//$'\n'/ }"; tmp=''; eval "for i in ${LST}; do tmp+=\"\$i \"; done"; LST=${tmp}; unset tmp
+# Copy dirs/files defined in LST
+for i in ${LST}; do
+    mkdir -p "${RAM_DISK_MOUNTPOINT}${i%/*}/"
+    cp -ax "$i" "${RAM_DISK_MOUNTPOINT}${i%/*}/"
+done
+# Tune the rest
+ln -s /bin/bash "${RAM_DISK_MOUNTPOINT}/bin/sh"
+# Set opendns and google public dns as default nameservers
+echo 'nameserver 208.67.222.222'$'\n''nameserver 8.8.8.8' >"${RAM_DISK_MOUNTPOINT}/etc/resolv.conf"
+
+log 'Switch pivot rootfs'
+mount --make-rprivate /  # Required for pivot_root to work
+pivot_root "${RAM_DISK_MOUNTPOINT}" "${RAM_DISK_MOUNTPOINT}/oldroot"
+for i in proc dev sys run; do mount --move /oldroot/$i /$i; done
+cd /
+LOG="/oldroot${LOG}"
+STATUS_LOG="/oldroot${STATUS_LOG}"
+
+# Now it's limited rootfs in RAM, use only existing binaries!
+
+log 'Relaunch systemd'
+systemctl daemon-reexec
+
+if ((KEEP_SSH)); then
+    ## sshd
+    log 'Restart SSH daemon to close the old pty devices'
+    systemctl restart ssh.service  # || /etc/init.d/ssh restart
+    log 'WARNING: If you are logged in via SSH you have to open separate SSH connection and close this one. Avoid using existing Master Channel if any, use: ssh -M'
+
+    ## wpa_supplicant
+    # log 'Restart wpa_supplicant to close the old pty devices'
+    # systemctl restart wpa_supplicant.service  # || { killall wpa_supplicant; /sbin/wpa_supplicant -u -s -O /run/wpa_supplicant; }
+    # Note command example for wpa_supplicant: /sbin/wpa_supplicant -s -B -P /run/wpa_supplicant.wlan1.pid -i wlan1 -D nl80211,wext -c /etc/wpa_supplicant/wpa_supplicant.wlan1.conf
+    # Rerun existing commands
+    # TODO: verify that it works well, because seems an issue with wlan1 adapter (so commented for now)
+    # while read -rd $'\n' l; do
+    #     l=${l#${l%%[! ]*}}  # Remove leading spaces
+    #     [[ -z $l ]] && break
+    #     kill "${l%% *}"  # Kill existing
+    #     # shellcheck disable=SC2086
+    #     ${l#* } &>/dev/null
+    # done < <(exec -c ps -C wpa_supplicant -o pid=,command=)
+    # TODO: consider if should do the same with dhclient
+
+    # # shellcheck disable=SC2016
+    # log 'You can continue manually then.
+    # You will probably want to run:
+    #     sudo -s
+    #     fuser -km /oldroot
+    #     umount /oldroot
+    # In case you want to come back to the old rootfs:
+    #     mount "${SDCARD_DEVICE}p2" /oldroot
+    #     mount --make-rprivate /
+    #     pivot_root /oldroot "/oldroot${RAM_DISK_MOUNTPOINT}"
+    #     for i in proc dev sys run; do mount --move "${RAM_DISK_MOUNTPOINT}/$i" /$i; done'
+
+    # # Disable LED if any
+    # ((TRICOLOR_LED)) && led unexport
+
+    # log 'Exiting'
+    # exit 0
+fi
+
+log 'Relaunch bash to unbind from the old rootfs and continue in new one'
+# Export required only variables from current shell
+export TIMESTAMP_FORMAT LC_ALL DRY_RUN SDCARD_DEVICE LOG STATUS_LOG CHECK_CERT IMG_URL TRICOLOR_LED RAM_DISK_MOUNTPOINT led_pid
+# Export required only functions from current shell
+export -f log sysrq_reboot
+# Replace current bash process to new one from new rootfs
+# shellcheck disable=SC2093
+exec bash -s <<'EOFTHELASTCMD'
+
+log 'Ignore some signals to avoid termination'
+trap '' SIGHUP SIGTERM SIGINT SIGQUIT SIGTTIN SIGTTOU SIGTSTP
+
+log 'Terminate processes which use the old rootfs except some common'  # To free RAM space before downloading
+for p in $(exec -c fuser -m /oldroot); do
+    if [[ "$p" =~ ^[1-9].* ]]; then
+        p=${p//[a-zA-Z].*/}
+        read -rd '' comm </proc/$p/comm
+        case "${comm}" in
+            systemd|agetty|wpa_supplicant|sshd|bash|sleep|sudo) continue;;
+        esac
+        kill "$p"
+    fi
+done 2>/dev/null
+
+log 'Downloading archive with disk image to ramdisk...'
+wget -q --show-progress --dns-timeout=10 --connect-timeout=20 --read-timeout=30 ${CHECK_CERT} "${IMG_URL}" -O pi.img.txz 2>&1 | ( i=0; while read l; do ((i++ && i%256)) || log "${l##*.... }"; done )
+if ((${PIPESTATUS[0]})); then
+    # Try to bind to existing interfaces (retry on previous interface too)
+    for ip in $(exec -c hostname -I); do
+        wget -q --show-progress --dns-timeout=10 --connect-timeout=20 --read-timeout=30 ${CHECK_CERT} "${IMG_URL}" -O pi.img.txz 2>&1 | ( i=0; while read l; do ((i++ && i%256)) || log "${l##*.... }"; done )  # The same command as above
+        rcode=${PIPESTATUS[0]}
+        ((rcode)) || break
+    done
+    if ((rcode)); then
+        log "ERROR: Failed to download the image: ${IMG_URL}"
+        echo '2 Failed to download the image' >"${STATUS_LOG}"
+        log 'Reboot on error'; /bin/sleep 3
+        sysrq_reboot
+        exit 2
+    fi
+fi
+
+log 'Checking archive content...'
+# TODO: verify checksum
+tar tJf pi.img.txz  # Takes ~60 sec
+if (($? != 0)); then
+    log 'ERROR: Tar archive check failed'
+    echo '3 Tar archive check failed' >"${STATUS_LOG}"
+    log 'Reboot on error'
+    /bin/sleep 3
+    sysrq_reboot
+    exit 3
+fi
+log 'Archive is fine'
+
+if ((TRICOLOR_LED)); then
+    log 'Intermediate stage: Change LED to static orange while killing old processes and unmounting old rootfs'
+    # led unexport; sleep 0.6  # Need to stop blinking process (?)
+    led orange
+else
+    log 'Intermediate stage: killing old processes and unmounting old rootfs'
+fi
+
+log 'Detach all file descriptors for this process related to old rootfs'
+for fd in /proc/$$/fd/*; do
+    [[ "$(exec -c findmnt -n -o TARGET -T "${fd}")" == '/oldroot' ]] && eval "exec ${fd##*/}>/dev/null";
+done;
+
+log 'Terminate the rest of the processes which use the old rootfs. Supposed that it'\''s the last log line you can see on the same terminal.'
+fuser -km -SIGTERM /oldroot
+sleep 1
+
+log 'Try to unmount the old rootfs'
+umount /oldroot
+if (($? != 0)); then
+    log 'Failed to unmount. Kill the processes which are still alive after termination attempt'
+    fuser -km -SIGKILL /oldroot
+    sleep 1
+    log 'Try to unmount the old rootfs again'
+    umount /oldroot
+    if (($? != 0)); then
+        log 'ERROR: Failed to unmount the old rootfs'
+        echo '4 Failed to unmount the old rootfs' >"${STATUS_LOG}"
+        log 'Reboot on error'; /bin/sleep 3
+        sysrq_reboot
+        exit 4
+    fi
+fi
+log 'Successfully unmounted'
+
+if ((TRICOLOR_LED)); then
+    log 'Flashing stage: Change LED blinking appearance to red<->green 4Hz. Keep power attached or you'll have to reflash SD card manually!'
+    led blink 0.25 red green
+else
+    log 'Flashing stage. Keep power attached or you'll have to reflash SD card manually!'
+fi
+
+log 'Extract and flash the image to SD card on the fly'
+((DRY_RUN)) && log 'DRY_RUN: flashing to /dev/null'
+tar xOJf pi.img.txz | dd bs=512K conv=fsync oflag=direct "of=${SDCARD_DEVICE}"  # ~20 min for real flashing, ~60 sec for dry-run
+
+log 'Reboot finally'
+sysrq_reboot
+exit 0
+EOFTHELASTCMD
+exit 1  # Should be never executed because of `exec` above
