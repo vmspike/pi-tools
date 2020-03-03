@@ -19,6 +19,7 @@ If country empty or invalid drop to 00 (World).
 `SRC_FILE` if any will be removed after successful configuration.
 
 The script can be added to `/etc/rc.local` to check `SRC_FILE` on every boot, or you may create separate systemd service for it.
+It can be useful to setup wifi creds before OS booting by creation of file in /boot partition (which is FAT32 on Raspberry Pi, so the file can be created on Windows hosts easily).
 
 From command line `SRC_FILE` can be set by:
 ```
