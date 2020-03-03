@@ -595,7 +595,8 @@ ACTION
 
     restore [FILE]
         Restore LED state from the file. Inverse of "save" action.
-        If FILE specified restore from that file instead of the default.
+        If FILE specified restore from that file instead of the default LED_SAVEFILE.
+        Default LED_SAVEFILE value is /run/tricolor-led/led.state
 
         Restored state will be printed to stdout (with prefix line "Restored:"
         on stderr).

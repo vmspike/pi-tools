@@ -21,8 +21,8 @@ Custom options will be loaded from config file if present. See script defaults f
 
 Options priority: commandline options > config options > script defaults
 
-Commandline options:
 ```
+Commandline options:
     --config str
         Must be the first argument if specified!
         Options from config file overrides script defaults.
@@ -56,6 +56,9 @@ Commandline options:
     --sdcard-device str
         The device to be flashed.
         Default is /dev/mmcblk0
+
+Depends: bash (>= 4.3), coreutils (>= 8.26), grep (>= 2.27), util-linux (>= 2.29.2), mount (>= 2.29.2), psmisc (>= 22.21), iproute2 (>= 4.9.0), wget (>= 1.18), tar (>= 1.29b), xz-utils (>= 5.2.2), procps (>= 2:3.3), bsdutils (>= 1:2.29.2), openssl (>= 1.1.0f)
+Recommends: tricolor-led (>= 1.0.0)
 ```
 TODO:
 - Current script state is unstable, thorough testing required.

@@ -15,7 +15,7 @@ To build deb package:
 - clone this repo and go to the dir with sources, e.g. `cd ./pi-tools/tricolor-led/tricolor-led-1.0.0/`
 - run `dch -i` to set proper changelog entry
 - run `cd ./` to apply changed PWD (if dch have renamed current dir)
-- Build the package: `debuild -uc -us -b`, if all is fine you'll find it in parent dir `../`
+- build the package: `debuild -uc -us -b`, if all is fine you'll find it in parent dir `../`
 
 Output of `led man`:
 ```
@@ -114,7 +114,8 @@ ACTION
 
     restore [FILE]
         Restore LED state from the file. Inverse of "save" action.
-        If FILE specified restore from that file instead of the default.
+        If FILE specified restore from that file instead of the default LED_SAVEFILE.
+        Default LED_SAVEFILE value is /run/tricolor-led/led.state
 
         Restored state will be printed to stdout (with prefix line "Restored:"
         on stderr).

@@ -14,7 +14,8 @@ else
     case "$1" in
         '') ;;
         -r|--raw) echo "${CPU}"; exit 0;;
-        *) echo "ERROR: Unknown option: $1" >&2; exit 1;;
+        *)  echo "ERROR: Unknown option: $1" >&2
+            exit 1
     esac
     CPU=${CPU:: -3}.${CPU: -3}
     echo "CPU: ${CPU} °C"

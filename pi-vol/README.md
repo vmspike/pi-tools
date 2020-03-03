@@ -1,7 +1,7 @@
 # vol
 
-Allows to change PCM volume by quick "vol" command.
-This script is just a mapping for "amixer" tool.
+Allows to change PCM volume by quick `vol` command.
+This script is just a mapping for `amixer` tool.
 
 You can choose audio device by `VOL_DEVICE` environmental variable (default is "PCM").
 
