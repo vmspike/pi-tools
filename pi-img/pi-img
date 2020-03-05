@@ -1,0 +1,2171 @@
+#!/bin/bash
+
+readonly SCRIPT_VERSION='0.7'
+
+# Bash version in numbers like 4003046, where 4 is major version, 003 is minor, 046 is subminor.
+printf -v BV '%d%03d%03d' "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"
+if ((BV < 4003014)); then
+    echo "ERROR: bash version ${BASH_VERSION} is too old, minimal version is 4.3.14" >&2
+    exit 1
+fi
+
+read -rd '' USAGE <<'EOFUSAGE'
+DESCRIPTION
+    Helps to manage disk images for single board computers: create/change, flash, mount.
+
+USAGE
+    pi-img [--config CONFIG] [ACTION] [OPTIONS]
+
+ACTION
+    help, --help, usage, man
+        Print this help. This is the default if run without arguments.
+        The text outputs to stderr and exit code is 255.
+
+        Action "man" behave a bit differently: try to print using pager
+        ("less" or "more" in most cases) or stdout if no pager. Exit code in
+        this case is equal to pager exit code.
+
+    create
+        Create custom disk image from a source image.
+
+        It's recommended to create the image on the same hardware as the image
+        destination hardware.
+
+        See OPTIONS for more info.
+
+    flash
+        Flash existing disk image to SD card optionally with additional
+        changes on just flashed SD card (like expanding rootfs partition to
+        fill all available space, generate unique keys, etc.). Additional
+        changes speed up first boot and may help to avoid first boot issues.
+
+    mount
+        Mount all partitions from the disk image to "--mount-dir" value.
+        Required subfolders for each partition will be automatically created.
+        All already mounted image partitions will be preliminary unmounted.
+
+    umount, unmount
+        Unmount all mounted disk image partitions.
+
+    version, --version
+        Output the script version to stdout and exit.
+
+    check-deps, deps
+        Check for existence of all binaries ever present in the script. Output
+        the error mesage for each non-existing binary.
+        Return code is 0 if all binaries exists, 1 if some binary does not
+        exist.
+        Recommended to run on first launch to be sure that all dependencies
+        satisfied.
+        Some binaries are optional but recommended, if does not exist
+        alternatives will be used instead.
+
+    solve-deps
+        Experimantal! Only for deb-based OS.
+        Find and install required packages for the script.
+        Current version just install predefined list of packages without
+        attempt to find necessary list by comparison tool and package.
+        Finally dependency check will be executed as in "check-deps" action.
+
+OPTIONS
+    Notes:
+        Option and its value can be specified on commandline using syntax:
+            --option VALUE
+            OR
+            --option=VALUE
+
+        All values of boolean options [0|1] can be specified using various
+        case insensitive words:
+                True:  1, y, yes, true
+                False: 0, n, off, false
+
+            If short option is available (let's say -o) it can be specified as:
+                True:  -o1, -o
+                False: -o0
+            Note: Empty values (if VALUE is an empty string '') will be kept empty,
+                  but True/False check `((''))` for them is False (has return code 1).
+
+        All required options for specific action with no defaults will be
+        asked interactively if interactive mode enabled. Others will use
+        default values.
+
+        All relative directories will be converted to absolute (by "realpath" util).
+
+        Some options are useless with some actions so takes no effect.
+
+    --config, -c CONFIG
+        Must be the first argument if specified, even before action!
+        Options from config file overrides script defaults.
+
+        To overwrite default options in config file you need to convert option
+        name to upper case and replace "-" with "_". E.g. "--work-dir
+        './work'" will be "WORK_DIR='./work'".
+        You also may want to see "Defaults" section in the script sources.
+
+        Defaults to /etc/pi-img.conf
+
+    --work-dir, -w WORK_DIR
+        Work dir. The script will use it for most temporary or final files.
+        It's also default for base dir for source disk image.
+
+        Defaults to current directory ("PWD" shell variable).
+
+    --tmp-dir TMP_DIR
+        Directory for small temporary files. It can be kept unclean if an
+        error occured. If this option is omitted default directory will be
+        created automatically. If present the directory must exist already.
+
+        Defaults to /tmp/pi-img.tmp.d
+
+    --rootfs-changes-dir ROOTFS_CHANGES_DIR
+        Recursively copy all content from this dir to rootfs of the image on
+        image creation.
+        All copied files will be owned by root and has the same permissions,
+        so you may need to adjust ownership manually after creation (e.g. use
+        creation hooks) or use --rootfs-changes-tarball instead.
+
+        Has no default
+
+    --rootfs-changes-tarball ROOTFS_CHANGES_TARBALL
+        Not implemented
+
+    --source-image-url, -u SOURCE_IMAGE_URL
+        URL for source disk image to download.
+        Will be used if no local disk image usage requested.
+
+        Defaults to latest Raspbian lite (no graphical UI, command line only):
+            https://downloads.raspberrypi.org/raspbian_lite_latest
+
+    --raspbian-name, -n RASPBIAN_NAME
+        Base Raspbian image name.
+        If the image with the same name exists in WORK_DIR it will be reused.
+        Extension ".img" will be automatically added if absent.
+        It will be also used as a first part of the final disk image name.
+
+        Defaults to automatically extract from --source-image-url value if
+        exists and available, or drop to "raspbian.img".
+
+    --pi-image-version, -v PI_IMAGE_VERSION
+        Disk image version. Alphanumeric characters with dot and underscore only.
+        Will be used in final disk image name.
+
+        Has no default value.
+
+    --pi-image-version-file PI_IMAGE_VERSION_FILE
+        Full path of filename for PI_IMAGE_VERSION on disk image.
+        Set to empty string '' if you don't want to save image version to the
+        file on image creation.
+
+        Defaults to /etc/disk_image_version
+
+    --mount-dir MOUNT_DIR
+        Base directory where loopback image or SD card partitions will be
+        mounted to (subdirectories for each will be automatically created and
+        finally removed).
+
+        Defaults to TMP_DIR value.
+
+    --default-pi-password DEFAULT_PI_PASSWORD
+        Will be used for user (uid 1000) initial password on image creation.
+
+        Has no default value.
+
+    --keep-src-image [0|1]
+    -k1, -k
+    -k0
+        Decide if source/original disk image will be kept untouched or new
+        disk image will overwrite it. Not to keep is faster and disk space
+        effective (no cloning) but not suitable for multiple [re]builds
+        because it will have to be redownloaded in this case.
+
+        Defaults to 1 (keep).
+
+    --img, --image IMG
+        Path to disk image to flash to SD card.
+        It can be also specified as an argument exactly after "flash" action
+        (avoiding --img option name).
+
+        Has no default value.
+
+    --sdcard SDCARD
+        Path to SD card device where to flash the image.
+        Must be the block device (like "/dev/mmcblk0") or the character special
+        device (like "/dev/null").
+        It can be also specified as a 3rd argument exactly after IMG this way:
+        pi-img flash path/to/IMAGE.img /dev/SDCARD0
+
+        Has no default value.
+
+    --sdcard-erase-on-flash [0|1]
+    -e1, -e
+    -e0
+        If SD card needs to be erased before flashing (takes few minutes
+        depends on SD card speed).
+        Can be specified for security reasons to completely remove previous SD
+        card content.
+
+        Defaults to 0 (not erase).
+
+    --sdcard-erase-on-flash-src SDCARD_ERASE_ON_FLASH_SRC
+        Source device to use for erasing.
+        "/dev/zero" and "/dev/urandom" are reasonable choices.
+
+        Defaults to "/dev/zero".
+
+    --dd-bs DD_BS
+        dd "bs" (block size) option. See "man dd" for more info.
+        It's not recommended to set this value to less than 512.
+
+        For USB 3.0/3.1 cardreader and UHS SD card increasing of this value
+        can significantly speedup flashing. Measure optimal value for your
+        cardreader and SD card.
+
+        Defaults to 4M
+
+    --dd-conv DD_CONV
+        dd "conv" comma separated options list for flashing (not for erasing).
+        See "man dd" for more info.
+        "sparse" value can decrease flashing time for 20-40% for sparse
+        images by trying to seek rather than write the output for NUL input
+        blocks, but can lead to errors on not zeroed SD card.
+        Empty line '' allowed to discard defaults.
+        "fsync" conv option will be automatically prepended and can be
+        overwritten only by "fdatasync" option.
+
+        Defaults to '' (empty string).
+
+    --dd-oflag DD_OFLAG
+        dd "oflag" comma separated options list for flashing and erasing.
+        Allowed options are only "direct", "nonblock" and '' (empty string).
+
+        Defaults to "direct".
+
+    --dd-status DD_STATUS
+        dd "status" option. See "man dd" for more info.
+        "progress" value shows periodic transfer statistics (if supported).
+
+        Defaults to "progress" for interactive mode, "none" for non-
+        interactive, empty for dd versions below 8.24.
+
+    --early-boot-ssh [0|1]
+        Force enabling/disabling SSH server before successful boot by creation
+        of /boot/ssh file.
+        It's Raspbian specific, other OSes may ignore this file.
+
+        Defaults to '' (keep existing configuration)
+
+    --shrink-rootfs [0|1]
+        Shrink image rootfs partition on image creation to decrease virtual image size.
+        It can speedup flashing when "--dd-conv sparse" applied, but it's
+        suitable only for limited use cases when SD card already zeroed.
+
+        If you're going to add some files to the image after creation you
+        probably want to disable shrinking, othervise it can be lack of free
+        space.
+
+        Defaults to 0 (do not shrink).
+
+    --apt-extra-pkgs APT_EXTRA_PKGS
+        Deb packages space and/or newline separated list which will be
+        installed on image creation.
+
+        Be sure you've quoted or escaped the argument APT_EXTRA_PKGS so it
+        will be passed to the script as a single value.
+
+        Defaults to '' (no packages will be installed).
+
+    --apt-dist-upgrade [0|1]
+    --apt-upgrade [0|1]
+    --apt-autoremove [0|1]
+        If "apt-get dist-upgrade", "apt-get upgrade", or "apt-get autoremove"
+        correspondingly have to be run on disk image rootfs during image
+        creation.
+        If --apt-dist-upgrade enabled, "apt-get upgrade" will not be
+        called regardless of --apt-upgrade state.
+
+        Defaults to 0
+
+    --pi-username PI_USERNAME
+        The new name for the user with UID 1000. In Raspbian it's "pi" by
+        default, so "pi" user will be renamed. Its home dir and all related
+        files also will be changed correspondingly.
+        Set it to empty string '' if you want to keep it unchanged.
+
+        Defaults to '' (keep existing username)
+
+    --flash [0|1]
+        To skip SD card flashing set this options to false.
+        Can be useful if you want to apply post flashing actions to already flashed SD card.
+
+        Defaults to 1 (proceed with flashing)
+
+    --post-flashing [0|1]
+        Post flashing actions can be enabled by setting this option to false.
+
+        Post flashing actions useful to make actions directly with SD card
+        (e.g. expand rootfs) as well as to make each SD card unique when you
+        are going to flash the same image to multiple SD cards (e.g. use
+        different SSH server keys or SSL certs).
+
+        Defaults to 0 (do not run post flashing actions)
+
+    --expand-rootfs [0|1]
+        Expand rootfs after flashing to fill all available space of SD card.
+        It may help to speedup first boot and/or in situations when rootfs
+        expanding on first boot is disabled or not implemented in the image.
+
+        Works only if "--post-flashing 1".
+
+        Defaults to 0 (do not expand, the OS may do so on first boot of pi).
+
+    --regenerate-ssh-server-keys [0|1]
+        Regenerate SSH server keys after flashing.
+
+        Works only if "--post-flashing 1".
+
+        Defaults to 1 (regenerate).
+
+    --tar-pack [0|1]
+        If final image have to be packed to tar archive after creation.
+
+        Defaults to 0 (do not pack)
+
+    --cert-generate [0|1]
+        Generates self-signed SSL certs after after flashing.
+        If enabled it generates two pairs of SSL certs inside PI_SSL_DIR:
+            main.key
+            main.crt
+            any.key
+            any.crt
+        as well as DH key:
+            dh.pem
+        See also corresponding --cert-* options.
+
+        Works only if "--post-flashing 1".
+
+        Defaults to 0 (do not generate).
+
+    --cert-subj CERT_SUBJ
+        Self-signed certificates subject string for "--cert-generate" option.
+
+        Defaults to:
+            /C=00/ST=self/L=self/O=self/OU=self/CN=*/emailAddress=self@example.com/UID=${RANDOM}
+
+        where ${RANDOM} is a random number between 0 and 32767. UID randomness
+        required for some web browsers which might slow down TLS handshake
+        when multiple certs saved with the same subject.
+
+    --cert-dh-sz CERT_DH_SZ
+        Diffie-Hellman certificate size.
+        Used in post flashing part to generate unique dh.pem file.
+        Allowed values: 256, 512, 1024, 2048, 4096, 8192, 16384
+
+        Works only if "--cert-generate 1".
+
+        Defaults to 1024 (provide enough security with reasonable generation time)
+
+    --cert-valid-days CERT_VALID_DAYS
+        Certificates will be valid for CERT_VALID_DAYS days.
+
+        Works only if "--cert-generate 1".
+
+        Defaults to 18262 (~50 years)
+
+    --interactive [0|1]
+    -i1, -i
+    -i0
+        In interactive mode user will be asked for an action (input option
+        variable, input password, etc.)
+        In non-interactive mode the script will exit if situation cannot be
+        solved without user intervention.
+
+        If the shell itself is not interactive the script drop to non-
+        interactive mode regardless of specified value or defaults.
+
+        Defaults to 1 (interactive).
+
+    --sd-overclock [0|25|40|50|80|100]
+        Overclock/downclock microSD reader: set SD reader frequency in MHz.
+        It's "Raspberry Pi 3 Model B" specific. RPi3B default is 50 MHz.
+
+        For development purposes if you use high end UHS SD card and existing
+        /boot/config.txt allows to overclock SD card (has commented line with
+        "dtparam=sd_overclock=") you can specify overclock frequency on
+        flashing.
+
+        It allows to encrease SD card speed up to ~42MB/s (on 100MHz) while
+        non-overclocked limit is ~22MB/s (50MHz). It's because RPi do not support UHS
+        mode at all but well designed SD cards can increase speed in SD mode:
+        https://www.reddit.com/r/raspberry_pi/comments/4aoc3r/how_to_overclock_the_microsd_card_reader_on_a/
+
+        Defaults to 0 (keep existing configuration)
+
+    --automounting-enabled [0|1]
+        Notify the script if automounting tool works in user UI.
+
+        If this option explicitly specified automounting tool detection will
+        be skipped, which may speedup execution for few seconds.
+
+        Defaults to '' (autodetect)
+
+    --dry-run [0|1]
+        Not implemented
+
+EXAMPLES
+    - What's going on?
+    pi-img man         # To see this help
+    pi-img check-deps  # To check if your system has all dependencies satisfied
+    pi-img solve-deps  # Solve them if not (experimental, for Debian derivatives only)
+
+
+    - Have an image, how to [securely] flash it?
+    # Fast flash with default options
+    pi-img flash ./path/to/pi.img /dev/mmcblk0
+
+    # Slow but secure flash, all previously existing data erased and filled by
+    # pseudo random data before flashing, then flashed as is (do not skip NUL
+    # input blocks).
+    pi-img flash --img ./pi.img --sdcard /dev/mmcblk0 \
+        --sdcard-erase-on-flash yes --sdcard-erase-on-flash-src /dev/urandom
+
+
+    - Have nothing, but want to flash custom disk image...
+    # Note: It can be required to build the image on Pi itself (or compatible
+    # host) to enable some image options.
+
+    # Create temporary work dir to be sure you're safe and cd to it
+    cd $(mktemp -dp ./)
+
+    # Download this script
+    # Note: "wget" works only for public repos, for private use web browser
+    wget https://github.com/vmspike/pi-tools/raw/master/pi-img/pi-img
+    ln -vs "$(realpath ./pi-img)" /usr/local/bin/
+    # OR clone full repo
+    git clone git@github.com:vmspike/pi-tools.git || git clone https://github.com/vmspike/pi-tools.git
+    ln -vs "$(realpath ./pi-tools/pi-img/pi-img)" /usr/local/bin/
+
+    # Build fresh development image with required custom options,
+    # input your user password for sudo when asked
+    pi-img create --pi-version dev \
+        --keep-src-image no \
+        --tar-pack no \
+        --early-boot-ssh yes \
+        --default-pi-password 'SupDup!!!1' \
+        --apt-dist-upgrade 1 \
+        --apt-extra-pkgs 'htop vim whatever'
+
+    # If you've built the image on the device and have no USB cardreader move just
+    # created image to your host and flash there than.
+    # Note: "scp" doesn't support sparse files so use "rsync":
+    #     rsync -aPS pi@PiIP:/path/to/image/*.pi-dev.img ./
+    # Or just detach SD card form Pi and attach to your PC, mount, and use the image
+    # on its filesystem for flashing.
+
+    # Flash it
+    pi-img flash THEIMAGE.img /dev/mmcblk0
+    # If you're going to flash multiple SD cards sequentially and have enough
+    # free RAM to increase flashing speed you can preliminary add the
+    # image to filesystem cache:
+    cat THEIMAGE.img >/dev/null
+    # or copy it to RAM disk "/dev/shm/" and flash from it.
+    # It may speedup flashing for few % depends on your disk subsystem.
+    # Also you can use optimal block size for flashing (may be 8M or higher
+    # against default 4M), it also can drop couple of seconds:
+    pi-img flash --img THEIMAGE.img --sdcard /dev/mmcblk0 --dd-bs 8M
+
+
+    - Want to apply some changes to existing image without recreation.
+    # If you do not need to run binaries in chroot you can apply them on the host with any CPU arch:
+    # Mount existing image
+    pi-img mount THEIMAGE.img
+    # Apply changes and unmount
+    pi-img umount THEIMAGE.img
+    # You can unmount using 'sudo umount /path/to/boot /path/to/rootfs' as well
+EOFUSAGE
+
+
+### Defaults
+export LC_ALL=C  # To avoid locale issues
+TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
+WGET_TIMEOUTS='--dns-timeout=10 --connect-timeout=20 --read-timeout=30'
+DEPENDENCIES='grep zgrep ls cp wget bsdtar mv sfdisk parted tr sudo umount mount mkdir chmod chown ln usermod sed dd mkpasswd realpath touch rmdir uname losetup sync mktemp fallocate blockdev e2fsck resize2fs openssl tail tune2fs truncate tee sort'  # The script dependencies
+DEPENDENCIES_OPTIONAL='less zerofree'  # The script optional dependencies, other tools will be used instead if does not exist.
+
+# Default compression level for xz compressor (used in image pack creation).
+# -9 use 65M for unpack, -8 use 33M, -7 use 17M (for others see "man xz"),
+# so -7 is optimal for pack_sz+unpack_mem when pack size is about 250M, so optimal
+# for flashing by pi-reset because it use ramdisk. For larger pack size
+# higher compression level can be considered.
+XZ_LEVEL=7
+
+TMP_DIR_DEFAULT_BASENAME='pi-img.tmp.d'  # Added to default TMP_DIR value (if --tmp-dir option is not specified)
+TMP_DIR_DEFAULT_DIRNAME='/tmp'
+
+# UIG/GID is fixed, do not change
+PI_UID=1000
+PI_GID=1000
+
+# TODO: avoid hardcoding
+HOST_CPU_ARCH=$(exec -c uname -m)  # CPU arch of the host where the script executed
+TARGET_CPU_ARCH='armv7l'  # CPU arch of the pi where created disk image will be used
+# TARGET_ABI='armhf'
+
+# shellcheck disable=2164
+[[ -d "${PWD}" ]] || cd ./  # Workaround if work dir was renamed after cd to it
+WORK_DIR=${PWD}  # PWD is the current working directory as set by the cd command
+SOURCE_IMAGE_URL='https://downloads.raspberrypi.org/raspbian_lite_latest'
+SOURCE_IMAGE_URL_FILENAME=''  # Temporary empty initial variable for SOURCE_IMAGE_URL
+RASPBIAN_NAME=''  # By default will be get from commandline args, SOURCE_IMAGE_URL, or drop to raspbian.img
+PI_IMAGE_VERSION=''  # User will be prompted if empty
+DEFAULT_PI_PASSWORD=''  # Will be used for user (with id 1000) initial password
+KEEP_SRC_IMAGE=1  # Keep base Raspbian image unmodified. If false disk image will overwrite it (faster).
+SDCARD=''  # The device name of SD cardreader, empty to ask interactively, can be like /dev/mmcblk0
+SDCARD_ERASE_ON_FLASH=0  # If SD card need to be erased before flashing (mostly for security reasons)
+SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'  # Source device to use for erasing, /dev/zero and /dev/urandom are reasonable choices
+
+DD_BS=4M  # Default dd block size (only for some dd commands), 1M is 1048576
+DD_CONV=''  # Default dd conv option (only for flash dd command)
+DD_STATUS=''  # Choice depends on INTERACTIVE value and dd version
+DD_CONV_FSYNC='fsync'  # Can be fsync or fdatasync or empty
+DD_OFLAG='direct'  # Can be direct and/or nonblock (comma separated)
+
+IMG=''  # Disk image for flashing. User will be prompted if empty.
+EARLY_BOOT_SSH=''  # Force enabling/disabling SSH server before successful first boot
+TAR_PACK=0  # If final image have to be packed to tar archive after creation
+INTERACTIVE=1
+AUTOMOUNTING_ENABLED=''
+ROOTFS_CHANGES_DIR=''
+ROOTFS_CHANGES_TARBALL=''
+# DRY_RUN=0
+PI_SSL_DIR='/etc/ssl'  # No trailing slash
+CERT_SUBJ="/C=00/ST=self/L=self/O=self/OU=self/CN=*/emailAddress=self@example.com/UID=${RANDOM}"
+# 1024 DH because 2048 generation takes ~35min on RPi, while 1024 takes few
+# minutes (so can be done in background) with enough security for current
+# needs
+CERT_DH_SZ=1024
+CERT_VALID_DAYS=18262
+
+APT_EXTRA_PKGS=''
+
+APT_DIST_UPGRADE=0
+APT_UPGRADE=0
+APT_AUTOREMOVE=0
+PI_IMAGE_VERSION_FILE='/etc/disk_image_version'
+
+# The new name of the user with uid 1000. In Raspbian it's "pi" by default, so "pi" user will be renamed
+PI_USERNAME=''
+
+FLASH=1
+LOG_SCRIPT_VERSION=1  # Show the script version on each run
+SHRINK_ROOTFS=0  # Shrink rootfs on image creation to speedup flashing
+
+# Suppose that rootfs is on 2nd partition, it's a must for now
+# TODO: autodetect all partitions and their type
+ROOTFS_PART_NUM=2
+
+SD_OVERCLOCK=0
+
+# Post flashing options
+POST_FLASHING=0
+CERT_GENERATE=0  # Create web certs
+EXPAND_ROOTFS=0  # Expand rootfs to fill all SD card space on postflashing
+REGENERATE_SSH_SERVER_KEYS=1  # Regenerate ssh keys on postflashing
+
+shopt -s dotglob
+
+# Read CONFIG from commandline args if specified as a first argument
+CONFIG='/etc/pi-img.conf'
+if [[ "$1" == '--config' || "$1" == '-c' ]]; then
+    CONFIG="$2"
+    shift 2
+    [[ -r "${CONFIG}" ]] || { echo "No such file or not readable: ${CONFIG}"; exit 1; }
+fi
+### END Defaults
+
+
+# Export options from config if present
+# shellcheck disable=1090
+[[ -r "${CONFIG}" ]] && . "${CONFIG}"
+
+### Functions
+log() {
+    # if [[ -z ${TIMESTAMP_FORMAT} ]]; then
+    #     local TIMESTAMP_FORMAT
+    #     TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
+    # fi
+
+    if ((INTERACTIVE)); then
+        # Colorize output
+        if [[ -z "${*%%ERROR:*}" ]]; then
+            printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ $'\e[1;31m'ERROR$'\e[0m':$'\e[0;31m'"${*#ERROR:}"$'\e[0m'
+        elif [[ -z "${*%%WARNING:*}" ]]; then
+            printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ $'\e[1;33m'WARNING$'\e[0m':$'\e[0;33m'"${*#WARNING:}"$'\e[0m'
+        elif [[ -z "${*%%OK:*}" ]]; then
+            printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ $'\e[1;32m'OK$'\e[0m':$'\e[0;32m'"${*#OK:}"$'\e[0m'
+        elif [[ -z "${*%%INFO:*}" ]]; then
+            printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ $'\e[1;36m'INFO$'\e[0m':$'\e[0;36m'"${*#INFO:}"$'\e[0m'
+        else
+            printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ $'\e[0;36m'"$*"$'\e[0m'
+        fi
+    else
+        # Use plain text
+        printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ "$*"
+    fi
+}
+
+
+quit() {
+    if [[ -n $2 ]]; then  # Message specified
+        if (($1)); then  # Non-zero exit code
+            log "ERROR: $*" >&2
+        else
+            log "OK: $*" >&2
+        fi
+    fi
+    sync
+    case "${ACTION}" in
+        create|flash)
+            s=${SECONDS}
+            # shellcheck disable=2017
+            log "Script execution time: ${s}s ($((s/3600))h $(((s-s/3600*3600)/60))m $((s%60))s)"
+            ;;
+    esac
+    exit "$1"
+}
+
+
+##
+# Suppress some message specified as a pattern on standard input.
+# First argument is a pattern to supress.
+# Pattern is interpreted as in ${parameter/pattern/string}
+##
+# suppress_progress_msg() {
+#     # TODO: seems doesn't work
+#     local l
+#     while read -rd $'\r' l || [[ -n $l ]]; do echo -n $'\r'"${l/$1}      "; done
+#     echo
+# }
+
+
+##
+# Ask for sudo password first time to avoid asking later
+##
+ask_for_sudo_password() {
+    ((UID==0)) && return 0  # Already run as root
+    local n=2  # Trying n times
+    for ((i=0;i<n;i++)); do
+        if sudo -n true 2>/dev/null; then
+            # Password already remembered
+            break
+        else
+            # Password not yet remembered
+            if ((INTERACTIVE)); then
+                log 'Superuser privileges required for some actions, please input your user password for sudo access:'
+                sudo true && break  # Ask for password interactively
+                log "Failed to get superuser rights (attempt $((i+1))/2)"
+            else
+                quit 240 'Unable to ask for sudo access in non-interactive mode'
+            fi
+        fi
+    done
+    ((i<n)) || quit 5 'Failed to get superuser rights'
+}
+
+
+##
+# Unmount existing device partitions if any.
+# Specify the device name as a first argument.
+##
+unmount_mounted_partitions() {
+    local rval SDCARD proc_mounts tmp dev
+    rval=0  # Success by default
+    SDCARD=$1
+    if [[ -z "${SDCARD}" ]]; then
+        quit 1 'unmount_mounted_partitions: invalid syntax: non empty argument required'
+    fi
+
+    # Have to preliminary make mountpoints snapshot
+    read -rd '' proc_mounts </proc/mounts
+
+    # shellcheck disable=2034,2162
+    while read dev tmp; do
+        # if [[ "${dev}" =~ ^"${SDCARD}"p?[0-9]+$ ]]; then
+        if [[ "${dev::${#SDCARD}}" == "${SDCARD}" ]]; then
+            # Mounted partition found
+            log "Unmounting mounted partition: ${dev}"
+            sudo umount -vA "${dev}" || rval=$?
+            # log "Unmounting all partitions of the device: ${SDCARD}"
+            # sudo umount -vA "${SDCARD}"* || rval=$?
+            # break
+        fi
+    done <<<"${proc_mounts}"
+
+    return "${rval}"
+}
+
+
+##
+# Reread device partition tables.
+# All device's partitions will be unmounted if automounting tool is enabled.
+#
+# Specify the device name as a first argument.
+#
+# Globals:
+#   AUTOMOUNTING_ENABLED
+##
+reread_partitions() {
+    local SDCARD
+    SDCARD=$1
+    if [[ -z "${SDCARD}" ]]; then
+        quit 1 'reread_partitions: invalid syntax: non empty argument required'
+    fi
+
+    # TODO: add command line option to specify if automounting tool is enabled without prediction
+    if [[ -z "${AUTOMOUNTING_ENABLED}" ]]; then
+        # Check if automounting tool enabled for this SD card
+        log 'Trying to detect automounting tool...'
+        sleep 2  # Give time for automounting tool (if any) to mount partitions
+        log "Reread ${SDCARD} partitions"
+        # "blockdev --rereadpt" return non-zero exit code if the device is busy (e.g. mounted)
+        if ! sudo blockdev --rereadpt "${SDCARD}"; then  # Failed to reread
+            log 'Failed to reread device partitions, seems interfere with automounting tool.'
+            log "INFO: Consider to disable automounting to avoid issues and speedup flashing."
+            AUTOMOUNTING_ENABLED=1
+        else  # Successful reread immediatelly after flashing
+            # Check if will be automounted after successfull reread
+            sleep 2  # Give time for automounting tool (if any) to mount partitions
+            if ! sudo blockdev --rereadpt "${SDCARD}"; then  # Failed to reread after flashing
+                log 'Failed to reread device partitions, seems interfere with automounting tool.'
+                log "INFO: Consider to disable automounting to avoid issues and speedup flashing."
+                AUTOMOUNTING_ENABLED=1
+            else  # Successful reread
+                log "Successful reread of ${SDCARD} partitions"
+                log "Looks like automounting is disabled for ${SDCARD}, fine."
+                AUTOMOUNTING_ENABLED=0
+            fi
+        fi
+    fi
+
+    if ((AUTOMOUNTING_ENABLED)); then
+        sleep 2  # Give time for automounting tool to mount partitions
+        unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partitions before partitions reread attempt'
+    fi
+
+    log "Reread ${SDCARD} partitions"
+    sudo blockdev --rereadpt "${SDCARD}"  # Return non-zero exit code if the device is busy (e.g. mounted)
+    # shellcheck disable=2181
+    if (($?)); then  # Failed to reread
+        log 'Failed to reread device partitions using "blockdev --rereadpt", using "partprobe".'
+        # Should work even with mounted partitions and return zero exit code
+        sudo partprobe "${SDCARD}" || quit 22 'Failed to reread device partitions using "partprobe"'
+    fi
+
+    if ((AUTOMOUNTING_ENABLED)); then
+        sleep 2  # Give time for automounting tool to mount partitions after reread
+        unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partitions after successful partitions reread'
+    fi
+}
+
+
+##
+# Generates random string with desired length from specified source.
+# Usage: bpwgen [-v VAR] LEN SRC
+# Default LEN is 8
+# Default SRC is alphanumeric latin letters
+# If SRC starts with - and such option exists it has special meaning
+##
+bpwgen() {
+    local var src sl len i res
+    if [[ $1 == '-v' ]]; then var=$2; shift 2; fi
+    [[ -n "$1" ]] && len=$1 || len=8  # No check
+    # [[ "$1" =~ ^[0-9]+$ ]] && len=$1 || len=8  # Regex check
+    # (($1)) && len=$1 || len=8  # ARITHMETIC EVALUATION check
+    case "$2" in
+        ''|-an|--alphanumeric)  # Default
+            src='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';;
+        -a|--alpha)
+            src='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';;
+        -n|--numeric)
+            src='0123456789';;
+        -b|--no-ambiguous)
+            src='2345679abcdefghjkmnpqrstuvwxyzACEFGHJKLMNPRSTUVWXYZ';;
+        -l|--lowercase)
+            src='0123456789abcdefghijklmnopqrstuvwxyz';;
+        -u|--uppercase)
+            src='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';;
+        -s|--secure)
+            src='!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~'\';;
+        *)  # Custom
+            src=$2;;
+    esac
+    sl=${#src}
+    for ((i=0;i<len;i++)); do
+        res+=${src:$((RANDOM%sl)):1}
+    done
+
+    if [[ -n ${var} ]]; then
+        declare -g "${var}"
+        printf -v "${var}" '%s' "${res}"
+    else
+        printf '%s\n' "${res}"
+    fi
+}
+
+
+##
+# Gather image info.
+#
+# Set globals in conjunction with sfdisk output:
+#   IMG_PART_START   - array with partitions start blocks
+#   IMG_PART_END     - array with partitions end blocks
+#   IMG_PART_SECTORS - array with partitions sectors count
+#   IMG_PART_SIZE    - array with partitions human readable sizes
+#   IMG_PART_ID      - array with partitions type id (e.g.: 'c', '83', etc)
+#   IMG_PART_TYPE    - array with partitions types (e.g.: "W95 FAT32 (LBA)", "Linux")
+#   IMG_PART         - array with partitions basenames
+#   IMG_BS           - image block size
+##
+gather_image_info() {
+    local IMG p s e sc sz Id Type
+    IMG=$1
+    log 'Gather image info'
+    sync
+    # To be sure not to reuse existing values
+    unset IMG_BS
+    IMG_PART_START=()
+    IMG_PART_END=()
+    IMG_PART_SECTORS=()
+    IMG_PART_SIZE=()
+    IMG_PART_ID=()
+    IMG_PART_TYPE=()
+    IMG_PART=()
+
+    {
+        # shellcheck disable=2162
+        read -a IMG_BS; IMG_BS=${IMG_BS[3]}
+        # shellcheck disable=2034,2162
+        while read p s e sc sz Id Type; do
+            IMG_PART_START+=("${s}")
+            IMG_PART_END+=("${e}")
+            IMG_PART_SECTORS+=("${sc}")
+            IMG_PART_SIZE+=("${sz}")
+            IMG_PART_ID+=("${Id}")
+            IMG_PART_TYPE+=("${Type}")
+            IMG_PART+=("${p##*/}")  # basename only, not full path
+        done
+    } < <(LC_ALL=C sfdisk -l -- "${IMG}" | grep -e '^I/O' -e "^${IMG}[0-9]" | tr -d '*' | tr -s ' ')
+
+    # TODO: implement deeper verification
+    if  [[ -z "${IMG_BS}" \
+        || -z "${IMG_PART_START[*]}" \
+        || -z "${IMG_PART_END[*]}" \
+        || -z "${IMG_PART_SECTORS[*]}" \
+        || -z "${IMG_PART_SIZE[*]}" \
+        || -z "${IMG_PART_ID[*]}" \
+        || -z "${IMG_PART_TYPE[*]}" \
+        || -z "${IMG_PART[*]}" \
+        ]]; then
+        quit 1 'Failed to gather image info'
+    fi
+}
+
+
+##
+# Mount all partitions from the image
+#
+# Set globals:
+#   BOOT_MOUNTPOINT
+#   ROOTFS_MOUNTPOINT
+#   IMG_MOUNTPOINTS
+##
+mount_img() {
+    local IMG IMG_PART_START IMG_PART_SECTORS IMG_PART IMG_BS p s e sc tmp
+    IMG=$1
+    if [[ -z "${IMG}" ]]; then
+        log 'ERROR: Cannot mount: No image specified'
+        return 1
+    fi
+
+    gather_image_info "${IMG}"
+
+    ask_for_sudo_password
+
+    IMG_MOUNTPOINTS=("${IMG_PART[@]/#/${MOUNT_DIR}/}")  # All image mountpoints
+
+    # Try to unmount if already mounted
+    umount_img "${IMG}"
+
+    log 'Creating path(s) for mounting (if required)'
+    mkdir -vp "${IMG_MOUNTPOINTS[@]}" 2>/dev/null || sudo mkdir -vp "${IMG_MOUNTPOINTS[@]}" || quit 1 'Failed to create path(s) for mounting'
+
+    log 'Mounting all partitions from the disk image:'
+    for ((i=0;i<${#IMG_PART[@]};++i)); do
+        sudo mount -v -o loop,rw,offset=$((IMG_PART_START[i]*IMG_BS)),sizelimit=$((IMG_PART_SECTORS[i]*IMG_BS)) "${IMG}" "${IMG_MOUNTPOINTS[$i]}" || quit 6 "Failed to mount partition $((++i))"
+    done
+
+    # Set useful aliases for first two IMG_MOUNTPOINTS items
+    # TODO: Verify that it's really boot and rootfs partitions
+    BOOT_MOUNTPOINT=${IMG_MOUNTPOINTS[0]}  # First partition
+    ROOTFS_MOUNTPOINT=${IMG_MOUNTPOINTS[1]}  # Second partition
+
+    # TODO: also test if ${ROOTFS_MOUNTPOINT}/boot is empty
+    if [[ -n "${BOOT_MOUNTPOINT}" && -n "${ROOTFS_MOUNTPOINT}" && -d "${ROOTFS_MOUNTPOINT}/boot" ]]; then
+        log 'Mount (bind) boot partition to /boot dir of rootfs'
+        sudo mount --bind "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}/boot" || log 'ERROR: Failed to mount boot partition to /boot dir of rootfs'
+    fi
+
+    return 0
+}
+
+
+##
+# Unmount all partitions from the image.
+# If first argument exist unmount all mounted image partitions.
+# If not unmount partitions from IMG_MOUNTPOINTS array (which have to be
+# preliminary set by mount_img) and remove empty mountpoints.
+##
+umount_img() {
+    if [[ -n "$1" ]]; then  # Unmount all image partitions
+        local IMG tmploop l m n tmpmp tmp
+        IMG=$1
+
+        # sudo umount "${IMG_MOUNTPOINTS[@]}" &>/dev/null
+        # tmploop=(); while read l; do tmploop+=("${l%%: *}"); done < <(exec -c losetup -j "${IMG}")
+        tmploop=()
+        # shellcheck disable=2162
+        while read l; do
+            tmploop+=("${l%%: *}")
+        done < <(losetup -j "${IMG}" | sort)  # "sort" required to unmount boot partition first
+        if [[ -n "${tmploop[*]}" ]]; then
+            if [[ "$2" == '--rmdir' ]]; then
+                # TODO: Fix the case when it's more than 10 loop devices
+                tmpmp=()
+                # shellcheck disable=2034,2068,2162
+                while read l m n; do tmpmp+=("${m}"); done < <(exec -c grep ${tmploop[@]/#/-e ^} /proc/mounts)
+            fi
+            log 'Unmounting already mounted partitions assosiated with the image:'
+            # sudo umount -vA "${tmploop[@]}" || return $?
+            # Use separate command for each loop device because "umount -A" does not work correctly with multiple devices on single command
+            for tmp in "${tmploop[@]}"; do
+                sudo umount -vA "${tmp}" || return $?
+            done
+            if [[ "$2" == '--rmdir' ]]; then
+                log 'Removing empty mountpoints (keep if non-empty):'
+                # TODO: be sure that */boot partitions will not be deleted for sure.
+                sudo rmdir -v -- "${tmpmp[@]}"
+            fi
+        else
+            log 'The image is not mounted'
+            return 0
+        fi
+    elif [[ -n "${IMG_MOUNTPOINTS[*]}" ]]; then  # Unmount all existing image mount points
+        log 'Unmounting image partitions:'
+        sudo umount -vR "${IMG_MOUNTPOINTS[@]}" || return $?
+        if [[ "$1" == '--rmdir' ]]; then
+            log 'Removing empty mountpoints (keep if non-empty):'
+            sudo rmdir -v -- "${IMG_MOUNTPOINTS[@]}"
+        fi
+    else
+        return 1
+    fi
+    return 0
+}
+
+
+##
+# Create disk image from the source disk image.
+# Generally works with globall variables.
+##
+create_image() {
+    local tmp o i v lo out
+
+    log "Current work dir: ${WORK_DIR}"
+    cd "${WORK_DIR}" || quit 1 "Failed to change directory to WORK_DIR: ${WORK_DIR}"
+
+    ## Create/be_sure sparse Raspbian exists
+    if [[ -f "${RASPBIAN_IMG}" ]]; then
+        if [[ "${RASPBIAN_IMG}" -ef "${RASPBIAN_NAME}" ]]; then
+            # The same file or hardlinks to the same file
+
+            # Check if it's already sparse
+            # shellcheck disable=2034,2162
+            read real_sz tmp tmp tmp tmp sz tmp <<<"$(exec -c ls -ls "${RASPBIAN_IMG}")"
+            if [[ ${real_sz} -eq ${sz} ]]; then
+                log 'Sparsifying existing Raspbian image...'
+                fallocate -vd -- "${RASPBIAN_NAME}" || quit 1 'Failed to sparsify'
+            fi
+        else
+            log 'Copying and sparsifying existing Raspbian image...'
+            cp --sparse=always -vT "${RASPBIAN_IMG}" "${RASPBIAN_NAME}" || quit 1 'Failed to copy'
+        fi
+    else
+        log 'Downloading Raspbian image and sparsify it on the fly...'
+        ## Do with multiple steps (commented)
+        # # shellcheck disable=2086
+        # wget -q --show-progress ${WGET_TIMEOUTS} "${SOURCE_IMAGE_URL}" -O "${RASPBIAN_NAME}.zip" || quit 2 "Failed to download Raspbian image: ${SOURCE_IMAGE_URL}"
+        # IMG=$(exec -c zipinfo -1 "${RASPBIAN_NAME}.zip")
+        # unzip "${RASPBIAN_NAME}.zip"
+        # rm -vf -- "${RASPBIAN_NAME}.zip"
+        # # Make it sparse to reduce real image size (~30-50%)
+        # cp --sparse=always -vT "${IMG}" "${RASPBIAN_NAME}"
+        # rm -vf -- "${IMG}"
+
+        ## Alternatively do all on the fly supposing that it's only single file inside zip archive.
+        if ((KEEP_SRC_IMAGE)); then
+            log 'Creating image replica on downloading...'
+            # shellcheck disable=2086
+            wget -q --show-progress ${WGET_TIMEOUTS} "${SOURCE_IMAGE_URL}" -O- \
+                | bsdtar -xOf- \
+                | tee >(cp --sparse=always -T /dev/stdin "${RASPBIAN_NAME}.replica") \
+                      | cp --sparse=always -T /dev/stdin "${RASPBIAN_NAME}"
+        else
+            # shellcheck disable=2086
+            wget -q --show-progress ${WGET_TIMEOUTS} "${SOURCE_IMAGE_URL}" -O- \
+                | bsdtar -xOf- \
+                | cp --sparse=always -T /dev/stdin "${RASPBIAN_NAME}"
+        fi
+        for i in "${PIPESTATUS[@]}"; do
+            ((i==0)) || quit 2 'Failed to download and sparsify Raspbian image'
+        done
+        sync
+    fi
+
+    ## Check if the image has 2nd partition
+    # # Commented because not all "file"` versions support extended output, use sfdisk instead.
+    # out=$(exec -c file -- "${RASPBIAN_NAME}")
+    # if [[ -n "${out/* partition 2 */}" ]]
+    #     quit 4 "Raspbian image is broken (at least has no 2nd partition): ${out}"
+    # fi
+    out=$(exec -c sfdisk -l -- "${RASPBIAN_NAME}")
+    if ! grep -qe "^${RASPBIAN_NAME}2 " <<<"${out}"; then
+        quit 4 "Raspbian image is broken (has no 2nd partition or failed to check it)"
+    fi
+
+    log "Resulting image will be based on this Raspbian image:"
+    echo "${out/$'\n'$'\n'/$'\n'}"  # With empty lines removed
+
+    log 'Making disk image...'
+    PI_IMG="${RASPBIAN_NAME%.img}.pi-${PI_IMAGE_VERSION}.img"
+    if ((KEEP_SRC_IMAGE)); then
+        if  [[ -f "${RASPBIAN_NAME}.replica" && \
+            $(exec -c stat --printf="%s" -- "${RASPBIAN_NAME}") \
+            -eq \
+            $(exec -c stat --printf="%s" -- "${RASPBIAN_NAME}.replica") \
+            ]]; then
+            # Comparison by size should be enough here because images was downloaded simultaneously
+            # and names are also pretty similar.
+            # Checksum comparison is reliable but slow and considered redundant.
+            log "Rename Raspbian image replica"
+            mv -vfT "${RASPBIAN_NAME}.replica" "${PI_IMG}" || quit 1 'Failed to rename'
+        else
+            log "Cloning base Raspbian image to: ${PI_IMG}"
+            # dd is faster than cp because of higher block size (and can show
+            # progress) but final real image size will be slightly higher.
+            dd "${DD_BS}" "if=${RASPBIAN_NAME}" "of=${PI_IMG}" "conv=${DD_CONV_FSYNC},sparse" ${DD_STATUS} || quit 1 'Failed to clone'
+            # cp -vT "${RASPBIAN_NAME}" "${PI_IMG}" || quit 1 'Failed to clone'
+        fi
+    else
+        log 'Rename base Raspbian image'
+        mv -vfT "${RASPBIAN_NAME}" "${PI_IMG}" || quit 1 'Failed to rename'
+    fi
+    IMG=${PI_IMG}
+    # Now PI_IMG and IMG vars are the same
+
+    gather_image_info "${IMG}"
+
+    ## Check rootfs before mounting
+    log 'Create loop device for rootfs partition'
+    unset ROOTFS_LODEV
+    ROOTFS_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOTFS_PART_NUM-1]*IMG_BS)) "${IMG}")
+    # shellcheck disable=2181
+    [[ $? -eq 0 && -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+
+    log 'Check rootfs filesystem for errors and preen'
+    sudo e2fsck -pf "${ROOTFS_LODEV}" || { sudo losetup -d "${ROOTFS_LODEV}"; quit 1 'Failed to preen filesystem'; }
+    sync
+
+    log 'Detach rootfs loop device'
+    sudo losetup -d "${ROOTFS_LODEV}" || log 'WARNING: Failed to detach rootfs loop device'
+
+    mount_img "${IMG}"
+
+    log 'Configuring disk image...'
+    # TODO: Apply changes for any initial username, not just "pi"
+    if [[ -n "${PI_USERNAME}" && "${PI_USERNAME}" != 'pi' ]]; then
+        log "Rename \"pi\" user to \"${PI_USERNAME}\" (keep UID) and change all related files/dirs except /etc/sudoers.d/010_pi-nopasswd"
+        # shellcheck disable=1083
+        sudo mv -vf "${ROOTFS_MOUNTPOINT}/home/"{pi,"${PI_USERNAME}"}
+        sudo sed -i -e "s|^pi:|${PI_USERNAME}:|" -e "s|:/home/pi:|:/home/${PI_USERNAME}:|" "${ROOTFS_MOUNTPOINT}/etc/"{passwd,shadow}
+        sudo sed -i \
+            -e "s|^pi:|${PI_USERNAME}:|g" \
+            -e "s|:pi\$|:${PI_USERNAME}|g" \
+            -e "s|:pi,|:${PI_USERNAME},|g" \
+            -e "s|,pi,|,${PI_USERNAME},|g" \
+            -e "s|,pi\$|,${PI_USERNAME}|g" \
+            "${ROOTFS_MOUNTPOINT}/etc/"{group,gshadow}
+        sudo sed -i -e "s|^pi:|${PI_UID}:|" "${ROOTFS_MOUNTPOINT}/etc/subuid"
+        sudo sed -i -e "s|^pi:|${PI_GID}:|" "${ROOTFS_MOUNTPOINT}/etc/subgid"
+        echo changed: $'\n'"  ${ROOTFS_MOUNTPOINT}/etc/"{passwd,shadow,group,gshadow,subuid,subgid}
+    fi
+
+    if [[ -n "${ROOTFS_CHANGES_DIR}" ]]; then
+        log "Applying rootfs changes from: ${ROOTFS_CHANGES_DIR}"
+        log "INFO: All copied files will be owned by root and has the same permissions"
+
+        # If hidden files present dotglob required
+        # shopt -q dotglob || shopt -s dotglob  # TODO: need to revert after cp if changed
+        sudo cp -r --preserve=mode --no-preserve=ownership,timestamps -t "${ROOTFS_MOUNTPOINT}" "${ROOTFS_CHANGES_DIR}/"* || quit 7 'Failed to apply changes to rootfs of disk image'
+    fi
+    # TODO: do similar for ROOTFS_CHANGES_TARBALL
+
+    if [[ -n "${PI_IMAGE_VERSION_FILE}" ]]; then
+        log "Write the image version ${PI_IMAGE_VERSION} to ${PI_IMAGE_VERSION_FILE}"
+        echo "${PI_IMAGE_VERSION}" | sudo tee "${ROOTFS_MOUNTPOINT}${PI_IMAGE_VERSION_FILE}" &>/dev/null
+    fi
+
+    log 'Mount temporary directory for apt cache to save disk space'
+    sudo mkdir -p "${TMP_DIR}/cache/apt"
+    sudo mount -o bind "${TMP_DIR}/cache/apt" "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+
+    log 'Implementing changes in chroot environment...'
+    # TODO: (?) Avoid chroot to support build on any host avoiding "the same CPU arch" restriction.
+    #       Candidates: qemu, debootstrap, dpkg --root
+    sudo chroot "${ROOTFS_MOUNTPOINT}" /bin/bash -s <<EOFCHROOTCMD
+# This block is a root shell inside the image rootfs partition
+# Boot partition (if any) have to be mounted/binded to corresponding dir.
+# Variables with escaped dollar sign are local for chroot.
+# Variables with unescaped dollar sign will be substituted before execution.
+
+export LC_ALL=C
+export DEBIAN_FRONTEND='noninteractive'
+
+APT_DIST_UPGRADE="${APT_DIST_UPGRADE}"
+APT_UPGRADE="${APT_UPGRADE}"
+APT_AUTOREMOVE="${APT_AUTOREMOVE}"
+
+log() { printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' \$\$ "CHROOT: \$*"; }
+
+log 'Clean apt cache'
+apt-get clean
+
+log 'Update repo packages index files'
+apt-get -q update
+
+# TODO: Support to remove/purge any packages
+# log 'Purge dhcpcd* and remove its files'
+# apt-get -yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" purge "dhcpcd*"
+# rm -vrf /etc/dhcpcd.conf /etc/systemd/system/dhcpcd.service.d
+
+if ((APT_DIST_UPGRADE)); then
+    log 'Upgrade system: apt-get dist-upgrade'
+    apt-get -yq --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade
+elif ((APT_UPGRADE)); then
+    log 'Upgrade packages: apt-get upgrade'
+    apt-get -yq --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+fi
+
+log 'Clean apt cache'
+apt-get clean
+
+log 'Update repo packages index files'
+apt-get -q update
+
+log 'Installing required packages...'
+# TODO: In general case need to preliminary extend rootfs partition and filesystem
+#       to get rid of "No space left" if too much packages to install.
+apt-get -yq --allow-unauthenticated --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Use-Pty=0 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${APT_EXTRA_PKGS//$'\n'/ }
+
+if ((APT_AUTOREMOVE)); then
+    log 'Remove packages that were automatically installed to satisfy dependencies for other packages and no longer needed'
+    apt-get -yq autoremove
+fi
+
+log 'Clean apt cache'
+apt-get clean
+
+log 'Exit from chroot environment'
+exit 0
+EOFCHROOTCMD
+    # shellcheck disable=2162,2181
+    if (($?)); then
+        log "ERROR: Failed to chroot! Host and target CPU architectures may be incompatible (${HOST_CPU_ARCH} and ${TARGET_CPU_ARCH})."
+        sudo umount -p "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+        sudo rm -rvf -- "${TMP_DIR}/cache"
+        quit 222
+    fi
+
+    # log 'Clean apt cache on the image'
+    # sudo apt-get -o RootDir="${ROOTFS_MOUNTPOINT}" clean
+    # # # Analogue of 'apt-get clean' in chroot
+    # # for f in "${ROOTFS_MOUNTPOINT}/var/cache/apt/archives/"{,partial/}*; do
+    # #     case "${f##*/}" in
+    # #         lock|partial|'*') ;;
+    # #         *) sudo rm -rvf -- "${f}";;
+    # #     esac
+    # # done
+
+    log 'Unmount temporary directory for apt cache and clean'
+    sudo umount -p "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+    sudo rm -rvf -- "${TMP_DIR}/cache"
+
+    case "${EARLY_BOOT_SSH}" in
+        0)  log 'Force disabling SSH server on early boot stage'
+            [[ -f "${BOOT_MOUNTPOINT}/ssh" ]] && sudo rm -vf -- "${BOOT_MOUNTPOINT}/ssh"
+            ;;
+        1)  log 'Force enabling SSH server on early boot stage'
+            [[ -f "${BOOT_MOUNTPOINT}/ssh" ]] || sudo touch "${BOOT_MOUNTPOINT}/ssh"
+            ;;
+    esac
+
+    if [[ -n "${DEFAULT_PI_PASSWORD}" ]]; then
+        log "Change \"${PI_USERNAME}\" user password to: ${DEFAULT_PI_PASSWORD}"
+        sudo sed -i "s|^${PI_USERNAME}:[^:]*:|${PI_USERNAME}:$(exec -c mkpasswd -m sha-512 -s <<<"${DEFAULT_PI_PASSWORD}"):|" "${ROOTFS_MOUNTPOINT}/etc/shadow"
+    fi
+
+    log 'Be sure ~/.ssh folder exists for default user with correct permissions'
+    sudo mkdir -p "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+    sudo chown "${PI_UID}:${PI_GID}" "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+    sudo chmod 700 "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+
+    log 'Obtaining Linux kernel release of the image...'
+    kernel_img="${BOOT_MOUNTPOINT}/kernel7.img"
+    kernel_skip=$(exec -c grep -abo $'\x1f\x8b\x08\x00\x00\x00\x00\x00' "${kernel_img}" 2>/dev/null)
+    kernel_skip=${kernel_skip%%:*}
+    # Calculate max bs to speedup dd read
+    for ((bs=1024;bs>1;bs/=2)); do ((kernel_skip/bs*bs == kernel_skip)) && break; done
+    kernel_release=$(dd "if=${kernel_img}" "bs=${bs}" "skip=$((kernel_skip/bs))" | zgrep -aom1 'Linux version [^ ]\+' 2>/dev/null)
+    kernel_release=${kernel_release#Linux version }  # Have to be the same as 'uname -r' in chroot
+    if ! [[ "${kernel_release}" =~ ^[0-9a-z._-+]$ ]]; then
+        log "Linux kernel release: ${kernel_release}"
+        log 'Remove unused directories with kernel modules:'
+        for i in "${ROOTFS_MOUNTPOINT}"/lib/modules/*; do
+            if [[ "${kernel_release}" != "${i##*/}" ]]; then
+                sudo rm -rf -- "${i:?}"/*  # Avoid verbose deletion
+                sudo rm -rvf -- "${i:?}"  # Verbose deletion only for dir
+            fi
+        done
+    else
+        log "Linux kernel release is unknown"
+    fi
+
+    # read -r PI_IMAGE_DEBIAN_VERSION_MAJOR <"${ROOTFS_MOUNTPOINT}/etc/debian_version"
+    # PI_IMAGE_DEBIAN_VERSION_MAJOR=${PI_IMAGE_DEBIAN_VERSION_MAJOR%%[/\.]*}
+    # PI_IMAGE_DEBIAN_VERSION_MAJOR=${PI_IMAGE_DEBIAN_VERSION_MAJOR,,}  # To lowercase
+    # log "Image major Debian version is ${PI_IMAGE_DEBIAN_VERSION_MAJOR}"
+    # case "${PI_IMAGE_DEBIAN_VERSION_MAJOR}" in
+    #     8|jessie) quit 1 "Debian 8 (Jessie) is no longer supported. Use newer OS image.";;
+    #     9|stretch) PI_IMAGE_DEBIAN_VERSION_MAJOR=9;;
+    #     *)  # Failed to detect
+    #         # PI_IMAGE_DEBIAN_VERSION_MAJOR=0
+    #         log "WARNING: Unsupported image Debian version (${PI_IMAGE_DEBIAN_VERSION_MAJOR}), it can be incompatible with this tool!"
+    #         ;;
+    # esac
+
+    # log 'Remove files related to non RPi 3B from boot partition (to decrease final image size)'
+    # sudo rm -vf -- "${BOOT_MOUNTPOINT}/"{bcm270*.dtb,bcm2710-rpi-cm3.dtb,kernel.img}
+
+    # log 'Truncate logs and other history files'
+    # sudo find "${ROOTFS_MOUNTPOINT}" -type f -iname '*.log' -o -name '.wget-hsts' -exec truncate -cs0 {} \; -print
+
+    # log 'Remove existing ssh server keys (will be regenerated on first start)'
+    # sudo rm -vf -- "${ROOTFS_MOUNTPOINT}"/etc/ssh/ssh_host_*
+
+    log 'Zeroying empty space to minimize real size of the final sparse image...'
+    if hash zerofree 2>/dev/null; then  # If zerofree utility exists (faster)
+        # TODO: do for all ${IMG_MOUNTPOINTS[@]}" if supported
+        # rootfs
+        lo=$(exec -c grep -m1 -F -e " ${ROOTFS_MOUNTPOINT} " </proc/mounts)
+        lo=${lo%% ${ROOTFS_MOUNTPOINT} *}
+        ((INTERACTIVE)) && v='-v' || v=''
+        sudo mount -o remount,ro "${lo}"
+        sudo zerofree $v "${lo}"  # Require readonly on unmounted device
+
+        # boot
+        # LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${BOOT_MOUNTPOINT}/zeroes.tmp" status=none "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
+        LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${BOOT_MOUNTPOINT}/zeroes.tmp" status=none "conv=${DD_CONV_FSYNC}"
+        sudo rm -vf -- "${BOOT_MOUNTPOINT}/zeroes.tmp"
+    else  # No zerofree utility
+        for o in "${IMG_MOUNTPOINTS[@]}"; do
+            # LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${!o}/zeroes.tmp" ${DD_STATUS} "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
+            LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${!o}/zeroes.tmp" ${DD_STATUS} "conv=${DD_CONV_FSYNC}"
+            sudo rm -vf -- "${!o}/zeroes.tmp"
+        done
+    fi
+
+    log 'Sparsifying final image in place...'
+    fallocate -vd -- "${IMG}" || log 'ERROR: Failed to sparsify'
+
+    umount_img "${IMG}" --rmdir || log 'ERROR: Failed to unmount image partitions.'
+    # sudo rmdir -v -- "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
+    [[  "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+
+    if ((SHRINK_ROOTFS)); then
+        log 'Shrinking rootfs filesystem and partition to minimize final image virtual size...'
+
+        gather_image_info "${IMG}"
+
+        # log 'Create loop device(s) from partitions without mounting'
+        # unset LODEV
+        # LODEV=()  # define empty array
+        # for ((i=0;i<${#IMG_PART_START[@]};++i)); do
+        #     LODEV+=("$(exec -c sudo losetup -f --show -o $((IMG_PART_START[i]*IMG_BS)) "${IMG}")")
+        # done
+        # ROOTFS_LODEV=${LODEV[$((ROOTFS_PART_NUM-1))]}
+        # [[ -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+        log 'Create loop device for rootfs partition'
+        unset ROOTFS_LODEV
+        ROOTFS_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOTFS_PART_NUM-1]*IMG_BS)) "${IMG}")
+        [[ -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+
+        log 'Check rootfs filesystem for errors and preen'
+        sudo e2fsck -pf "${ROOTFS_LODEV}" || quit 1 'Failed to preen rootfs'
+        sync
+
+        log 'Shrink rootfs filesystem'
+        sudo resize2fs -M "${ROOTFS_LODEV}" | grep -v -e '^resize2fs ' -e '^$'
+        ((PIPESTATUS[0]==0)) || quit 1 'Failed to shrink rootfs filesystem'
+        sync
+
+        log 'Shrink rootfs partition'
+        # shellcheck disable=2162
+        { read _ _ BC; read _ _ BS; } < <(sudo tune2fs -l "${ROOTFS_LODEV}" | grep -e '^Block count:' -e '^Block size:')
+        IMG_LODEV=$(sudo losetup -f --show "${IMG}")
+        [[ -n "${IMG_LODEV}" ]] || quit 1 'Failed to create loop device for the image'
+        sudo sfdisk "${IMG_LODEV}" -N "${#IMG_PART[@]}" <<<"size=$((BC*BS/IMG_BS))" 2>&1 \
+        | grep -v \
+            -e '^Re-reading the partition table failed' \
+            -e '^The kernel still uses the old table' \
+            -e '^Calling ioctl() to re-read partition table' \
+            -e '^$'
+        ((PIPESTATUS[0]==0)) || quit 1 'Failed to shrink rootfs partition'
+        sync
+
+        log 'Detach just created loop devices'
+        # sudo losetup -d "${LODEV[@]}" "${IMG_LODEV}"
+        sudo losetup -d "${ROOTFS_LODEV}" "${IMG_LODEV}" || quit 1 'Failed to detach loop devices'
+
+        log 'Truncating the image (remove trailing unused space)'
+        # shellcheck disable=2162
+        read _ _ e _ < <(sfdisk -l "${IMG}" | grep -m1 -e "^${IMG_PART[$((ROOTFS_PART_NUM-1))]}" | tr -d '*')
+        sudo truncate -s $((++e*IMG_BS)) "${IMG}" || quit 1 'Failed to truncate'
+        sync
+
+        log 'Mount and unmount the image to be sure that the image is valid after shrinking'
+        mount_img "${IMG}" || quit 1 "Failed to mount the image. Rootfs shrinking failed."
+        umount_img "${IMG}" --rmdir || quit 1 "Failed to unmount the image. Rootfs shrinking failed."
+
+        log 'Shrinking of rootfs completed'
+    fi
+
+    log "Disk image created: ${PI_IMG}"
+
+    if ((TAR_PACK)); then
+        log "Creating disk image tar archive with xz compressor options: ${XZ_OPT}"
+        tar caS -f "${PI_IMG}.txz" "${PI_IMG}"  # XZ_OPT is already exported
+        # shellcheck disable=2181
+        if (($?==0)); then
+            log "Archive created: ${PI_IMG}.txz"
+        else
+            log 'ERROR: Failed to create tar archive'
+        fi
+    fi
+}
+
+
+##
+# Flash existing disk image to SD card with additional changes on just flashed SD card
+##
+flash_image() {
+    local IMG dev tmp
+    IMG=$1  # Must be already valid
+
+    # Do some heavy postflashing steps here in background so the results are ready
+    # when postflashing stage comes (or at least partially done).
+    if ((POST_FLASHING)); then
+        if ((CERT_GENERATE)); then
+            log 'Creating SSL certs in background for post flashing actions...'
+            # $$ below is this process PID
+
+            CERT_DH="${TMP_DIR}/$$.dh.pem"
+            openssl dhparam -outform PEM -out "${CERT_DH}" "${CERT_DH_SZ}" 2>/dev/null &
+
+            CERT_MAIN="${TMP_DIR}/$$.main"
+            openssl req -x509 -nodes -days "${CERT_VALID_DAYS}" -newkey rsa:2048 -keyout "${CERT_MAIN}.key" -out "${CERT_MAIN}.crt" -subj "${CERT_SUBJ}" 2>/dev/null &
+
+            CERT_ANY="${TMP_DIR}/$$.any"
+            openssl req -x509 -nodes -days "${CERT_VALID_DAYS}" -newkey rsa:2048 -keyout "${CERT_ANY}.key" -out "${CERT_ANY}.crt" -subj "${CERT_SUBJ}" 2>/dev/null &
+        fi
+    fi
+
+    ask_for_sudo_password
+
+    # Unmount existing SD card partitions if any
+    unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
+
+    if ((FLASH)); then
+        if ((SDCARD_ERASE_ON_FLASH)); then
+            if ! [[ -c "${SDCARD_ERASE_ON_FLASH_SRC}" ]]; then
+                log "WARNING: Erasing source device is not a character special device. Fallback to /dev/zero"
+                SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'
+            fi
+            log "Erasing SD card before flashing using ${SDCARD_ERASE_ON_FLASH_SRC} ..."
+            TS=${SECONDS}
+            # LC_ALL=C sudo dd "if=${SDCARD_ERASE_ON_FLASH_SRC}" "of=${SDCARD}" ${DD_BS} ${DD_STATUS} ${DD_OFLAG} 'iflag=fullblock' "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
+            LC_ALL=C sudo dd "if=${SDCARD_ERASE_ON_FLASH_SRC}" "of=${SDCARD}" ${DD_BS} ${DD_STATUS} ${DD_OFLAG} 'iflag=fullblock' "conv=${DD_CONV_FSYNC}"
+            log "Erasing completed in $((SECONDS-TS))s"
+
+            # Speedup image flashing to zeroed SD card using conv=sparse
+            if [[ "${SDCARD_ERASE_ON_FLASH_SRC}" == /dev/zero ]]; then
+                if [[ -z "${DD_CONV}" ]]; then
+                    DD_CONV='sparse'
+                elif ! [[ "${DD_CONV}" =~ conv=.*sparse.* ]]; then
+                    DD_CONV+=',sparse'
+                fi
+            fi
+        fi
+
+        # To fix external automounting tools issues
+        unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
+
+        log "Flashing the image (dd with ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS})..."
+        TS=${SECONDS}
+        sudo dd "if=${IMG}" "of=${SDCARD}" ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS} || quit 23 'Failed to flash the image'
+        log "Flashing completed in $((SECONDS-TS))s"
+
+        # TODO: optionally verify integrity by comparing original image and flashed SD card and/or by checking for badblocks via e2fsck -kfc
+
+        reread_partitions "${SDCARD}"
+
+        # TODO: autodetect and add all/other partitions (if any)
+        if [[ -b "${SDCARD}p1" && -b "${SDCARD}p2" ]]; then
+            SDCARD_PART=("${SDCART}" "${SDCARD}p1" "${SDCARD}p2")
+        elif [[ -b "${SDCARD}1" && -b "${SDCARD}2" ]]; then
+            SDCARD_PART=("${SDCART}" "${SDCARD}1" "${SDCARD}2")
+        else
+            quit 202 "Cannot find boot and/or rootfs partition(s) on SD card: ${SDCARD}"
+        fi
+
+        log 'Check rootfs filesystem for errors'
+        sudo e2fsck -nf "${SDCARD_PART[${ROOTFS_PART_NUM}]}" | tail -n 10
+        ((PIPESTATUS[0]==0)) || quit 1 'Rootfs is not clean after flashing! The image file or SD card might be corrupted or flashed with incorrect options.'
+    fi
+
+
+    # Stop here if post flashing actions disabled
+    ((POST_FLASHING)) || return 0
+    log 'Start post flashing actions...'
+    TS=${SECONDS}
+
+    ## Resizing rootfs to fill SD card
+    if ((EXPAND_ROOTFS)); then
+        # Rootfs resizing can sppedup first boot and/or
+        # help when cloned image is used as a source with auto resizing by OS already disabled.
+        # It's analog of local /usr/lib/raspi-config/init_resize.sh + /etc/init.d/resize2fs_once
+        log 'Start rootfs resizing to fill SD card...'
+        ts=${SECONDS}
+
+        reread_partitions "${SDCARD}"
+
+        SDCARD_PARTITION_TABLE=$(exec -c sudo parted -sm "${SDCARD}" unit s print)
+        SDCARD_NAME=${SDCARD##*/}
+        read -r SDCARD_SZ <"/sys/block/${SDCARD_NAME}/size"  # Size in blocks
+
+        # SDCARD_ID=$(sudo xxd -s 440 -ps -l 4 "${SDCARD}" | sed -e 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/g')
+        SDCARD_ID="$(LC_ALL=C sudo sfdisk -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+
+        # TODO: autodetect number of partitions (ROOTFS_PART_NUM). Now have to be 2
+        SDCARD_LAST_PART_NUM=${SDCARD_PARTITION_TABLE##*$'\n'}
+        SDCARD_LAST_PART_NUM=${SDCARD_LAST_PART_NUM%%:*}
+
+        # TODO: autodetect and add all/other partitions (if any)
+        if [[ -b "${SDCARD}p1" && -b "${SDCARD}p2" ]]; then
+            SDCARD_PART=("${SDCART}" "${SDCARD}p1" "${SDCARD}p2")
+        elif [[ -b "${SDCARD}1" && -b "${SDCARD}2" ]]; then
+            SDCARD_PART=("${SDCART}" "${SDCARD}1" "${SDCARD}2")
+        else
+            quit 202 "Cannot find boot and/or rootfs partition(s) on SD card: ${SDCARD}"
+        fi
+
+        # SDCARD_PART[N] aliases
+        SDCARD_PART_BOOT="${SDCARD_PART[1]}"
+        SDCARD_PART_ROOTFS="${SDCARD_PART[${ROOTFS_PART_NUM}]}"
+
+        BOOT_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_BOOT##*/}"
+        ROOTFS_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_ROOTFS##*/}"
+
+        log 'Creating paths for mounting (if required)'
+        mkdir -vp "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}" 2>/dev/null || sudo mkdir -vp "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
+
+        if ((SDCARD_LAST_PART_NUM == ROOTFS_PART_NUM)); then
+            # To fix third party automounting issues
+            unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
+
+            log 'Resizing rootfs partition to fill full SD card space'
+            ((INTERACTIVE)) && o='' || o='-s'
+            sudo parted ${o} -m "${SDCARD}" u s resizepart 2 $((SDCARD_SZ-1)) || quit 1 'Failed to expand rootfs'
+            sync
+
+            reread_partitions "${SDCARD}"
+
+            SDCARD_ID_NEW="$(LC_ALL=C sudo sfdisk -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+
+            if sudo mount -v "${SDCARD_PART_BOOT}" "${BOOT_MOUNTPOINT}"; then
+                log 'Remove init=/usr/lib/raspi-config/init_resize.sh from /boot/cmdline.txt'
+                sudo sed -i 's| init=/usr/lib/raspi-config/init_resize.sh||' "${BOOT_MOUNTPOINT}/cmdline.txt"
+                if ! grep -Fq splash "${BOOT_MOUNTPOINT}/cmdline.txt"; then
+                    log 'Remove quiet from /boot/cmdline.txt because splash specified'
+                    sudo sed -i "s| quiet[ $]| |g" "${BOOT_MOUNTPOINT}/cmdline.txt"
+                fi
+                log "Fix rootfs PARTUUID in /boot/cmdline.txt from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
+                sudo sed -i "s/${SDCARD_ID}/${SDCARD_ID_NEW}/" "${BOOT_MOUNTPOINT}/cmdline.txt"
+
+                IFS='' read -rd '' cmdline_txt <"${BOOT_MOUNTPOINT}/cmdline.txt"
+                log "Content of ${BOOT_MOUNTPOINT}/cmdline.txt:"$'\n'"${cmdline_txt}"
+                unset cmdline_txt
+
+                if ((SD_OVERCLOCK)) && grep -q '^#\s*dtparam=sd_overclock=[0-9]*' "${BOOT_MOUNTPOINT}/config.txt"; then
+                    log "Enable SD card overclock to ${SD_OVERCLOCK} MHz (only for UHS SD cards)"
+                    sudo sed -i -e "s|^#\s*dtparam=sd_overclock=[0-9]*|dtparam=sd_overclock=${SD_OVERCLOCK}|" "${BOOT_MOUNTPOINT}/config.txt"
+                fi
+
+                sudo umount -v "${BOOT_MOUNTPOINT}"
+            else
+                quit 203 "Failed to mount boot SD card partition: ${SDCARD_PART_BOOT}"
+            fi
+
+            log 'Check rootfs filesystem for errors and preen'
+            sudo e2fsck -pf "${SDCARD_PART_ROOTFS}" || quit 1 'Failed to preen rootfs filesystem'
+            sync
+
+            log 'Resizing rootfs to fill partition...'
+            ((INTERACTIVE)) && o='-p' || o=''
+            if sudo resize2fs ${o} "${SDCARD_PART_ROOTFS}"; then
+                mkdir -vp "${ROOTFS_MOUNTPOINT}" 2>/dev/null || sudo mkdir -vp "${ROOTFS_MOUNTPOINT}"
+                if sudo mount -v "${SDCARD_PART_ROOTFS}" "${ROOTFS_MOUNTPOINT}"; then
+                    log "Fix rootfs PARTUUID in /etc/fstab from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
+                    sudo sed -i "s/${SDCARD_ID}/${SDCARD_ID_NEW}/g" "${ROOTFS_MOUNTPOINT}/etc/fstab"
+
+                    sudo rm -vf -- "${ROOTFS_MOUNTPOINT}/etc/init.d/resize2fs_once"
+                    # shellcheck disable=2181
+                    if (($?==0)); then
+                        # Analog of local command: sudo update-rc.d resize2fs_once remove
+                        for f in "${ROOTFS_MOUNTPOINT}/etc/rc"[0-6S].d/*; do
+                            if [[ "$(exec -c readlink -sen "${f}")" == '/etc/init.d/resize2fs_once' ]]; then
+                                sudo rm -vf -- "${f}"
+                            fi
+                        done
+                    fi
+                    sudo umount -v "${ROOTFS_MOUNTPOINT}"
+                else
+                    quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOTFS}"
+                fi
+            else
+                log 'WARNING: Failed to resize rootfs to fill partition'
+            fi
+
+            # To fix third party automounting issues
+            unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
+            # reread_partitions "${SDCARD}"
+
+            log "Resizing rootfs partition to fill full SD card space completed in $((SECONDS-ts))s"
+        else
+            log "WARNING: Resizing of rootfs to fill SD card not supported: rootfs is not the last partition"
+        fi
+    fi
+    ## END Resizing rootfs to fill SD card
+
+
+    sudo mount -v "${SDCARD_PART_ROOTFS}" "${ROOTFS_MOUNTPOINT}" || quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOTFS}"
+
+    if ((REGENERATE_SSH_SERVER_KEYS)); then
+        log '[Re]generate SSH server keys'
+        for t in rsa ecdsa ed25519; do
+            sudo ssh-keygen -q -f "${ROOTFS_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" -t "$t" -N ''
+            sudo ssh-keygen -l -f "${ROOTFS_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" | sed 's/ root@\w\+//'
+        done
+    fi
+
+    log "Waiting for the following background processes to complete:"
+    jobs -l
+    wait
+    if ((CERT_GENERATE)); then
+        log 'Moving just generated SSL certificates to rootfs and change permissions'
+        sudo mkdir -vp "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}"  # Be sure that this dir exists
+        sudo mv -vfT "${CERT_DH}" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo chown 0:0 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo chmod 400 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo mv -vfT "${CERT_MAIN}.key" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/main.key"
+        sudo mv -vfT "${CERT_MAIN}.crt" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/main.crt"
+        sudo mv -vfT "${CERT_ANY}.key"  "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/any.key"
+        sudo mv -vfT "${CERT_ANY}.crt"  "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/any.crt"
+        sudo chown 0:0 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.{key,crt}
+        sudo chmod 400 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.key
+        sudo chmod 444 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.crt
+    fi
+
+    # TODO: unmount all partitions if other than boot and rootfs was mounted
+    sudo umount -v "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"  # ROOTFS_MOUNTPOINT must be specified last
+    sudo rmdir -v -- "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
+    [[  "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+
+    sync
+    log "Post flashing actions completed in $((SECONDS-TS))s"
+}
+
+
+##
+# Check for script dependencies
+##
+check_deps() {
+    rval=0
+    for i in ${DEPENDENCIES}; do
+        if ! hash "$i" &>/dev/null; then
+            log "ERROR: Required binary not found: $i"
+            rval=250
+        fi
+    done
+    for i in ${DEPENDENCIES_OPTIONAL}; do
+        if ! hash "$i" &>/dev/null; then
+            log "INFO: Optional binary not found: $i"
+        fi
+    done
+    if ((rval)); then
+        # log 'Each action require only part of all dependencies, you can proceed without satisfying all of them if you are sure.'
+        if hash apt-get &>/dev/null; then  # Debian derivative
+            log 'To satisfy dependencies try: pi-img solve-deps'
+            log 'Packages with required binaries also can be found by apt-file'
+        fi
+        # log 'ERROR: Some dependencies are not satisfied!'
+    fi
+    return ${rval}
+}
+
+
+##
+# Find and install required packages for the script
+##
+solve_deps() {
+    ## Get the list if all packs are already installed
+    # for i in ${DEPENDENCIES}; do dpkg -S $(exec -c readlink -sen $(exec -c which $i)); done | cut -d: -f1 | sort -u | xargs
+    PKGS='bsdtar coreutils e2fsprogs grep gzip mount openssl parted passwd sed sudo util-linux wget whois less zerofree'
+    ## Install
+    log "WARNING: ${ACTION} is experimental!"
+    hash apt-get 2>/dev/null || quit 1 'Not a Debian derivative (no apt-get), cannot satisfy dependencies automatically'
+    log 'Installing required packages...'
+    sudo apt-get update
+    if ((INTERACTIVE)); then
+        # shellcheck disable=2086
+        sudo apt-get install ${PKGS}
+        return $?
+    else
+        # shellcheck disable=2086
+        sudo apt-get -yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${PKGS}
+        # Not using --force-yes successors: --allow-downgrades --allow-remove-essential --allow-change-held-packages
+        return $?
+    fi
+
+
+    ## Draft
+    return
+    local i lst pack
+    lst=()  # Array
+    # TODO: implement. Find packs via apt-file, `dpkg -S` is only for already installed packages.
+    for i in ${DEPENDENCIES}; do
+        pack=$(exec -c dpkg -S "$(exec -c readlink -sen "$(exec -c which "$i")")")
+        pack=${pack%%:*}
+        lst+=("${pack}")
+    done
+    sudo apt-get install "${lst[@]}"
+}
+### END Functions
+
+
+ACTION=$1
+shift
+
+# Parse some simple actions
+case "${ACTION}" in
+    create|flash|mount|umount|unmount) ;;  # These actions will be processed later
+
+    check-deps|deps)
+        check_deps
+        rval=$?
+        ((rval==0)) && log 'All dependencies satisfied'
+        quit ${rval}
+        ;;
+
+    solve-deps)
+        solve_deps
+        check_deps
+        rval=$?
+        ((rval==0)) && log 'All dependencies satisfied'
+        quit ${rval}
+        ;;
+
+    ''|help|--help|usage)
+        echo "${USAGE}" >&2
+        exit 255
+        ;;
+
+    man)
+        if hash pager &>/dev/null; then
+            pager <<<"${USAGE}"
+        else
+            echo "${USAGE}"
+        fi
+        exit $?
+        ;;
+
+    version|--version)
+        echo "${SCRIPT_VERSION}"
+        exit 0
+        ;;
+
+    *) quit 1 "Unrecognized action: ${ACTION}"
+esac
+
+((LOG_SCRIPT_VERSION)) && log "pi-img version: ${SCRIPT_VERSION}"
+
+# # Check HOST and TARGET ABI compatibility
+# # TODO: find true way to detect ABI
+# SAME_HOST_TARGET_ABI=0
+# for f in /lib/*; do
+#     if [[ -z "${f/*${TARGET_ABI//-/_}*}" ]]; then
+#         SAME_HOST_TARGET_ABI=1
+#         break
+#     fi
+# done
+# declare -p SAME_HOST_TARGET_ABI
+
+# Quick script dependencies check, for least actions only
+check_deps || quit $?
+
+
+# Try to enable builtins (to avoid subprocesses creation, speedup execution)
+for i in sleep sync mkdir ln realpath rmdir tee head; do
+    enable -f "/usr/lib/bash/${i}" "${i}"
+done &>/dev/null
+
+
+### Parse arguments
+# Allow to set IMG and SDCARD for some actions without options
+if [[ -n "$1" && "${1::1}" != '-' ]]; then
+    case "${ACTION}" in
+        flash|mount|umount|unmount)
+            IMG=$1
+            if ! [[ -f "${IMG}" || -b "${IMG}" ]]; then
+                quit 1 "No such file or block device: ${IMG}"
+            fi
+            shift
+            if [[ -n "$1" && "${1::1}" != '-' && "${ACTION}" == 'flash' ]]; then
+                SDCARD=$1
+                if ! [[ -f "${SDCARD}" || -b "${SDCARD}" ]]; then
+                    quit 1 "No such file or block device: ${SDCARD}"
+                fi
+                shift
+            fi
+            ;;
+    esac
+fi
+
+# Clone command line arguments to access them via array indexes, and
+# also split long options and arguments on '=' if they're specified as --option=arg
+for arg in "$@"; do
+    if [[ "${arg}" =~ --[a-z-]+=.+ ]]; then
+        ARGS+=("${arg%%=*}" "${arg#*=}")
+    else
+        ARGS+=("${arg}")
+    fi
+done
+for ((i=0;i<${#ARGS[@]};i++)); do
+    case "${ARGS[$i]}" in
+        --work-dir|-w)
+            WORK_DIR=${ARGS[$((++i))]}
+            [[ -d "${WORK_DIR}" ]] || quit 1 "No such directory: ${WORK_DIR}"
+            ;;
+
+        --rootfs-changes-dir)
+            ROOTFS_CHANGES_DIR=${ARGS[$((++i))]}
+            [[ -d "${ROOTFS_CHANGES_DIR}" ]] || quit 1 "No such directory: ${ROOTFS_CHANGES_DIR}"
+            ;;
+
+        --rootfs-changes-tarball)
+            ROOTFS_CHANGES_TARBALL=${ARGS[$((++i))]}
+            [[ -f "${ROOTFS_CHANGES_TARBALL}" ]] || quit 1 "No such file: ${ROOTFS_CHANGES_TARBALL}"
+            ;;
+
+        --source-image-url|-u)
+            SOURCE_IMAGE_URL=${ARGS[$((++i))]}
+            # shellcheck disable=2086
+            wget_header=$(exec -c wget -qS --spider ${WGET_TIMEOUTS} "${SOURCE_IMAGE_URL}" 2>&1)
+            wget_rcode=$?
+            wget_status=${wget_header##* HTTP/1\.[01] }  # tmp
+            wget_status=${wget_status##* HTTP/2 }  # tmp
+            wget_status=${wget_status%%$'\n'*}  # E.g.: 404 Not Found
+            # wget_status_code=${wget_status%% *}  # E.g.: 404
+            # wget_status_msg=${wget_status#* }  # E.g.: Not Found
+            # If 'Content-Disposition: * filename=' exists
+            if [[ -n "${wget_header}" && -z "${wget_header##*Content-Disposition:* filename=*}" ]]; then
+                wget_filename=${wget_header##*Content-Disposition:* filename=}  # tmp
+                wget_filename=${wget_filename%%$'\n'*}  # E.g.: 2017-09-07-raspbian-stretch-lite.zip
+            # If failed to extract using filename= use last Location: value
+            elif [[ -n "${wget_header}" && -z "${wget_header##*Location:*}" ]]; then
+                wget_filename=${wget_header##*Location:}  # tmp
+                wget_filename=${wget_filename%%$'\n'*}  # tmp
+                wget_filename=${wget_filename##*/}
+            fi
+            [[ -z "${wget_filename}" ]] && quit 2 "URL is unavailable (${wget_rcode}: ${wget_status}): ${SOURCE_IMAGE_URL}"
+            [[ -z "${SOURCE_IMAGE_URL_FILENAME}" ]] && SOURCE_IMAGE_URL_FILENAME=${wget_filename%\.*}  # With extension removed (probably .zip)
+            unset wget_header wget_rcode wget_status wget_filename wget_status_code wget_status_msg
+            # Also see "Arguments post processing" block
+            ;;
+        --raspbian-name|-n)
+            RASPBIAN_NAME=${ARGS[$((++i))]}
+            [[ -z "${RASPBIAN_NAME/*\/*/}" ]] && quit 1 '--raspbian-name cannot contain /'
+            # Also see "Arguments post processing" block
+            ;;
+
+        --pi-image-version|-v) PI_IMAGE_VERSION=${ARGS[$((++i))]};;
+
+        --pi-image-version-file) PI_IMAGE_VERSION_FILE=${ARGS[$((++i))]};;
+
+        --mount-dir)
+            MOUNT_DIR=${ARGS[$((++i))]%/}  # Strip trailing slash if any
+            [[ -d "${MOUNT_DIR}" ]] || quit 1 "No such directory: ${MOUNT_DIR}"
+            ;;
+
+        --tmp-dir)
+            TMP_DIR=${ARGS[$((++i))]%/}  # Strip trailing slash if any
+            [[ -d "${TMP_DIR}" ]] || quit 1 "No such directory: ${TMP_DIR}"
+            ;;
+
+        --default-pi-password) DEFAULT_PI_PASSWORD=${ARGS[$((++i))]};;
+
+        --keep-src-image) KEEP_SRC_IMAGE=${ARGS[$((++i))]};;
+        -k1|-k) KEEP_SRC_IMAGE=1;;
+        -k0)    KEEP_SRC_IMAGE=0;;
+
+        --img|--image)
+            IMG=${ARGS[$((++i))]}
+            [[ -f "${IMG}" || -b "${IMG}" ]] || quit 1 "No such file or block device: ${IMG}"
+            ;;
+        --sdcard)
+            SDCARD=${ARGS[$((++i))]}
+            [[ -b "${SDCARD}" || -c "${SDCARD}" ]] || quit 1 "Not a block or character special device: ${SDCARD}"
+            ;;
+
+        --sdcard-erase-on-flash) SDCARD_ERASE_ON_FLASH=${ARGS[$((++i))]};;
+        -e1|-e) SDCARD_ERASE_ON_FLASH=1;;
+        -e0)    SDCARD_ERASE_ON_FLASH=0;;
+
+        --sdcard-erase-on-flash-src)
+            SDCARD_ERASE_ON_FLASH_SRC=${ARGS[$((++i))]}
+            [[ -c "${SDCARD_ERASE_ON_FLASH_SRC}" ]] || quit 1 "Not a character special device: ${SDCARD_ERASE_ON_FLASH_SRC}"
+            ;;
+
+        --dd-bs)
+            DD_BS=${ARGS[$((++i))]}
+            [[ "${DD_BS}" =~ ^[1-9][0-9]*(c|w|b|kB|K|MB|M|xM|GB|G|T)?$ ]] || quit 1 "Invalid dd block size: ${DD_BS}"
+            # dd also support suffixes P|E|Z|Y, but they are too big for our purposes.
+            ;;
+        --dd-conv)
+            DD_CONV=${ARGS[$((++i))]}
+            if [[ -n "${DD_CONV}" ]]; then
+                # Remove initial and trailing comma if any
+                if [[ "${DD_CONV::1}" == ',' ]]; then
+                    DD_CONV="${DD_CONV:1}"
+                fi
+                if [[ "${DD_CONV: -1}" == ',' ]]; then
+                    DD_CONV="${DD_CONV:: -1}"
+                fi
+
+                IFS=, read -ra tmp <<<"${DD_CONV}"
+                for o in "${tmp[@]}"; do
+                    case "${o}" in
+                        sparse|sync|noerror) ;;  # Ignore this list, others are not suitable for our purposes.
+                        fdatasync|fsync)
+                            DD_CONV_FSYNC=$o
+                            DD_CONV=${DD_CONV//,$o,}
+                            DD_CONV=${DD_CONV//,$o}
+                            DD_CONV=${DD_CONV//$o,}
+                            DD_CONV=${DD_CONV//$o}
+                            ;;
+                        *) quit 1 "Unsupported dd conv option: ${o}"
+                    esac
+                done
+            fi
+            ;;
+        --dd-oflag)
+            DD_OFLAG=${ARGS[$((++i))]}
+            case "${DD_OFLAG}" in
+                ''|direct|nonblock|direct,nonblock|nonblock,direct) ;;  # Ignore this list
+                *) quit 1 "Unsupported dd oflag options: ${DD_OFLAG}"
+            esac
+            ;;
+        --dd-status)
+            DD_STATUS=${ARGS[$((++i))]}
+            case "${DD_STATUS}" in
+                ''|none|noxfer|progress) ;;  # Ignore this list
+                *) quit 1 "Unsupported dd status option: ${DD_STATUS}"
+            esac
+            ;;
+
+        --early-boot-ssh) EARLY_BOOT_SSH=${ARGS[$((++i))]};;
+
+        --shrink-rootfs) SHRINK_ROOTFS=${ARGS[$((++i))]};;
+
+        --expand-rootfs) EXPAND_ROOTFS=${ARGS[$((++i))]};;
+
+        --regenerate-ssh-server-keys) REGENERATE_SSH_SERVER_KEYS=${ARGS[$((++i))]};;
+
+        --tar-pack) TAR_PACK=${ARGS[$((++i))]};;
+        -t1|-i) TAR_PACK=1;;
+        -t0)    TAR_PACK=0;;
+
+        --xz-opt|--tar-xz-opt)
+            # Overwrite default value with XZ_LEVEL inside
+            XZ_OPT=${ARGS[$((++i))]}
+            ;;
+
+        --apt-extra-pkgs) APT_EXTRA_PKGS=${ARGS[$((++i))]};;
+
+        --apt-dist-upgrade) APT_DIST_UPGRADE=${ARGS[$((++i))]};;
+        --apt-upgrade) APT_UPGRADE=${ARGS[$((++i))]};;
+        --apt-autoremove) APT_AUTOREMOVE=${ARGS[$((++i))]};;
+
+        --cert-subj)
+            CERT_SUBJ=${ARGS[$((++i))]}
+            # [[ "${CERT_SUBJ}" =~ ^(/C=[A-Z][A-Z])?(/ST=[a-zA-Z0-9-]+)?(/L=[a-zA-Z0-9-]+)?(/O=[a-zA-Z0-9-]+)?(/OU=[a-zA-Z0-9-]+)?(/CN=.+)?(/emailAddress=[a-zA-Z0-9-._]+@[a-zA-Z0-9-._]+)?/$ ]] || quit 1 "Invalid certificate subject: ${CERT_SUBJ}"
+            ;;
+
+        --cert-dh-sz)
+            CERT_DH_SZ=${ARGS[$((++i))]}
+            case "${CERT_DH_SZ}" in
+                256|512|1024|2048|4096|8192|16384) ;;
+                *) quit 1 "Invalid Diffie-Hellman cert size: ${CERT_DH_SZ}";;
+            esac
+            ;;
+        --cert-valid-days)
+            CERT_VALID_DAYS=${ARGS[$((++i))]}
+            [[ "${CERT_VALID_DAYS}" =~ ^[0-9]+$ ]] || quit 1 "Invalid --cert-valid-days value: ${CERT_VALID_DAYS}"
+            ;;
+
+        --pi-username)
+            PI_USERNAME=${ARGS[$((++i))]}
+            if ! [[ "${PI_USERNAME}" =~ ^[a-z_][a-z0-9_]{0,30}$ ]]; then
+                quit 1 "Invalid username: ${PI_USERNAME}"
+            fi
+            for tmp in root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats nobody systemd-timesync systemd-network systemd-resolve systemd-bus-proxy _apt apt messagebus statd ssh sshd avahi dnsmasq liquidsoap icecast2 config Debian-exim usbmux; do
+                [[ "${tmp}" == "${PI_USERNAME}" ]] && quit 1 "Username is in exception list (choose another one): ${PI_USERNAME}"
+            done
+            ;;
+
+        --flash) FLASH=${ARGS[$((++i))]};;
+
+        --post-flashing) POST_FLASHING=${ARGS[$((++i))]};;
+        --cert-generate) CERT_GENERATE=${ARGS[$((++i))]};;
+
+        --interactive) INTERACTIVE=${ARGS[$((++i))]};;
+        -i1|-i) INTERACTIVE=1;;
+        -i0)    INTERACTIVE=0;;
+
+        --sd-overclock)
+            SD_OVERCLOCK=${ARGS[$((++i))]}
+            case "${SD_OVERCLOCK}" in
+                0|25|40|50|80|100) ;;  # Valid values (integer divisors of the core clock 400)
+                *) quit 1 "Invalid SD_OVERCLOCK value: ${SD_OVERCLOCK}"
+            esac
+            ;;
+
+        --automounting-enabled) AUTOMOUNTING_ENABLED=${ARGS[$((++i))]};;
+
+        # --dry-run) DRY_RUN=${ARGS[$((++i))]};;
+
+        *) quit 1 "Invalid option: ${ARGS[$i]}"
+    esac
+done
+
+## Arguments post processing
+# # Force non-interactive shell if cannot be interactive
+# case "$-" in
+#     *i*) ;;             # interactive
+#     *) INTERACTIVE=0;;  # non-interactive
+# esac
+
+# Convert boolean vars to 0 or 1
+for o in KEEP_SRC_IMAGE SDCARD_ERASE_ON_FLASH EARLY_BOOT_SSH TAR_PACK INTERACTIVE APT_DIST_UPGRADE APT_UPGRADE APT_AUTOREMOVE POST_FLASHING CERT_GENERATE FLASH SHRINK_ROOTFS EXPAND_ROOTFS REGENERATE_SSH_SERVER_KEYS AUTOMOUNTING_ENABLED
+do
+    case "${!o,,}" in
+        # 'on' and 'off' removed from choices to avoid mistype no/on
+        1|y|yes|true) printf -v "${o}" '%s' 1;;
+        0|n|no|false) printf -v "${o}" '%s' 0;;
+        '') ;;  # Keep empty values. Note: `((''))` is False (has return code 1)
+        *)  O=${o,,}
+            quit 1 "Invalid value for boolean option --${O//_/-}: ${!o}"
+    esac
+done
+
+# Get rid of relative paths, use absolute paths
+for o in SDCARD_ERASE_ON_FLASH_SRC SDCARD IMG MOUNT_DIR WORK_DIR TMP_DIR ROOTFS_CHANGES_DIR
+do
+    [[ -z "${!o}" ]] && continue  # Ignore empty variables
+    tmp=$(exec -c realpath "${!o}") || quit 1 "Failed to get real path: ${!o}"
+    [[ "${tmp}" == '/' ]] && quit 1 "Option cannot be root directory /: ${o}"
+    printf -v "${o}" '%s' "${tmp}"
+done
+
+# Start work in WORK_DIR
+cd "${WORK_DIR}" || quit 1 "Failed to change directory to WORK_DIR: ${WORK_DIR}"
+
+[[ -z "${TMP_DIR}" ]] && TMP_DIR="${TMP_DIR_DEFAULT_DIRNAME}/${TMP_DIR_DEFAULT_BASENAME}"
+if ! [[ -d "${TMP_DIR}" ]]; then
+    log 'Creating temporary directory'
+    mkdir -vp "${TMP_DIR}" 2>/dev/null || sudo mkdir -vp "${TMP_DIR}" || quit 1 'Failed to create temporary directory'
+fi
+
+[[ -z "${MOUNT_DIR}" ]] && MOUNT_DIR=${TMP_DIR}
+
+if ((INTERACTIVE)); then
+    [[ -z "${DD_STATUS}" ]] && DD_STATUS='progress'
+    [[ -z "${XZ_OPT}" ]] && XZ_OPT="-${XZ_LEVEL}v"
+else  # non-interactive
+    [[ -z "${DD_STATUS}" ]] && DD_STATUS='none'
+    [[ -z "${XZ_OPT}" ]] && XZ_OPT="-${XZ_LEVEL}"
+    export DEBIAN_FRONTEND='noninteractive'
+fi
+export XZ_OPT
+
+# status=progress introduces in dd version 8.24, do not use it with older verions
+DD_VERSION=$(LC_ALL=C dd --version | grep -m1 -o '[0-9]\+\.[0-9]\+')  # Only two first numbers
+printf -v DD_VERSION '%d%03d' "${DD_VERSION%%.*}" "${DD_VERSION#*.}"
+if ((DD_VERSION < 8024)) && [[ "${DD_STATUS}" == 'progress' ]]; then
+    DD_STATUS=''
+fi
+
+# Append option name prefix to non empty DD_* vars
+[[ -n "${DD_STATUS}" ]] && DD_STATUS="status=${DD_STATUS}"
+[[ -n "${DD_BS}" ]] && DD_BS="bs=${DD_BS}"
+[[ -n "${DD_OFLAG}" ]] && DD_OFLAG="oflag=${DD_OFLAG}"
+[[ -n "${DD_CONV}" ]] && DD_CONV="conv=${DD_CONV_FSYNC},${DD_CONV}" || DD_CONV="conv=${DD_CONV_FSYNC}"
+
+# See also per-ACTION processing
+## END Arguments post processing
+### END Parse arguments
+
+
+### Main case
+case "${ACTION}" in
+    create)
+        # Check for CPU arch compatibility
+        # TODO: check ABI instead of CPU arch
+        if [[ "${HOST_CPU_ARCH}" != "${TARGET_CPU_ARCH}" ]]; then
+            quit 1 "Host and target CPU architectures are incompatible for image creation: ${HOST_CPU_ARCH} vs ${TARGET_CPU_ARCH}"
+        fi
+
+        # Ask for PI_IMAGE_VERSION if not set or invalid
+        [[ -z "${PI_IMAGE_VERSION}" && "${INTERACTIVE}" -eq 0 ]] && quit 240 'Unable to ask for disk image version version because of non-interactive mode'
+        for ((i=0;i<3;i++)); do
+            [[ "${PI_IMAGE_VERSION}" =~ ^[0-9a-zA-Z._]+$ ]] && break
+            ((i)) && echo 'Only alphanumeric characters with dot and underscore supported! Just number or "dev" are suitable choises.' >&2
+            # [[ "${PI_IMAGE_VERSION}" =~ ^[0-9]+$ || "${PI_IMAGE_VERSION}" == 'dev' ]] && break
+            # ((i)) && echo 'Only positive numbers or "dev" supported!' >&2
+            # shellcheck disable=2162
+            read -p "Enter disk image version (attempt $((i+1))/3): " PI_IMAGE_VERSION
+        done
+        ((i<3)) || quit 1 'No valid disk image version specified'
+
+        # Sort out RASPBIAN_NAME
+        if [[ -n "${RASPBIAN_NAME}" ]]; then
+            :  # Do nothing - was set as command line option
+        elif [[ -n "${SOURCE_IMAGE_URL_FILENAME}" ]]; then
+            # SOURCE_IMAGE_URL was set as command line option
+            # SOURCE_IMAGE_URL_FILENAME set based on the url filename
+            RASPBIAN_NAME=${SOURCE_IMAGE_URL_FILENAME}
+            if [[ -z "${RASPBIAN_NAME/*\/*/}" ]]; then  # / in the name or empty
+                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, drop to default
+                log "Failed to extract Raspbian image filename from url, drop to: ${RASPBIAN_NAME}"
+            fi
+        else
+            # Get RASPBIAN_NAME from default SOURCE_IMAGE_URL
+            # shellcheck disable=2086
+            wget_header=$(exec -c wget -qS --spider ${WGET_TIMEOUTS} "${SOURCE_IMAGE_URL}" 2>&1)
+            # If 'Content-Disposition: * filename=' exists
+            if [[ -n "${wget_header}" && -z "${wget_header##*Content-Disposition:* filename=*}" ]]; then
+                wget_filename=${wget_header##*Content-Disposition:* filename=}  # tmp
+                wget_filename=${wget_filename%%$'\n'*}  # E.g.: 2017-09-07-raspbian-stretch-lite.zip
+            # If failed to extract using filename= use last Location: value
+            elif [[ -n "${wget_header}" && -z "${wget_header##*Location:*}" ]]; then
+                wget_filename=${wget_header##*Location:}  # tmp
+                wget_filename=${wget_filename%%$'\n'*}  # tmp
+                wget_filename=${wget_filename##*/}
+            fi
+            if [[ -z "${wget_filename}" ]]; then
+                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, drop to default
+                log "Failed to extract Raspbian image filename from url, drop to: ${RASPBIAN_NAME}"
+            else
+                RASPBIAN_NAME=${wget_filename%\.*}  # With extension removed (probably .zip)
+                log "Autodetected Raspbian image name: ${RASPBIAN_NAME}"
+            fi
+            unset wget_header wget_rcode wget_filename
+        fi
+        [[ "${RASPBIAN_NAME: -4}" != '.img' ]] && RASPBIAN_NAME+='.img'  # Add 'img' extension if absent
+        unset SOURCE_IMAGE_URL_FILENAME
+
+        # Generate RASPBIAN_IMG
+        RASPBIAN_IMG="${WORK_DIR}/${RASPBIAN_NAME}"  # Will be downloaded if empty or does not exists
+
+        create_image
+        rval=$?
+        ;;
+
+    flash)
+        # Ask for IMG if not set or invalid
+        [[ -z "${IMG}" && "${INTERACTIVE}" -eq 0 ]] && quit 240 'Unable to ask for image location because of non-interactive mode'
+        for ((i=0;i<3;i++)); do
+            [[ -f "${IMG}" || -b "${IMG}" ]] && IMG=$(exec -c realpath "${IMG}") && break
+            ((i)) && echo 'No such file or block device!' >&2
+            # shellcheck disable=2162
+            read -p "Enter path to the disk image (attempt $((i+1))/3): " IMG
+        done
+        ((i<3)) || quit 1 'No valid disk image found'
+
+        # Ask for SDCARD if not set or invalid
+        [[ -z "${SDCARD}" && "${INTERACTIVE}" -eq 0 ]] && quit 240 'Unable to ask for SD card device because of non-interactive mode'
+        for ((i=0;i<3;i++)); do
+            [[ -b "${SDCARD}" || -c "${SDCARD}" ]] && SDCARD=$(exec -c realpath "${SDCARD}") && break
+            ((i)) && echo 'Not a block or character special device!' >&2
+            # shellcheck disable=2162
+            read -p "Enter path to SD card (attempt $((i+1))/3): " SDCARD
+        done
+        ((i<3)) || quit 1 'No valid SD card specified'
+
+        # Some validations
+        # # Commented because not all `file` versions support extended output
+        # out=$(exec -c file -- "${IMG}")
+        # if [[ -n "${out/* partition 2 */}" ]]
+        #     quit 4 "The image is broken (at least has no 2nd partition): ${out}"
+        # fi
+        if ! sfdisk -l -- "${IMG}" | grep -qe "^${IMG}2 "; then
+            quit 4 "The image is broken (at least has no 2nd partition)"
+        fi
+
+        flash_image "${IMG}"
+        rval=$?
+        [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+        ;;
+
+    mount)
+        [[ -f "${IMG}" ]] || quit 1 'Disk image not found'
+        mount_img "${IMG}"
+        rval=$?
+        ;;
+
+    umount|unmount)
+        [[ -f "${IMG}" ]] || quit 1 'Disk image not found'
+        umount_img "${IMG}" --rmdir
+        rval=$?
+        [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+        ;;
+esac
+
+quit "${rval:-255}"
