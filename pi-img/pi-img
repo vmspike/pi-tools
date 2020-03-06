@@ -1,6 +1,6 @@
 #!/bin/bash
 
-readonly SCRIPT_VERSION='0.7'
+readonly SCRIPT_VERSION='0.8'
 
 # Bash version in numbers like 4003046, where 4 is major version, 003 is minor, 046 is subminor.
 printf -v BV '%d%03d%03d' "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"
@@ -11,7 +11,7 @@ fi
 
 read -rd '' USAGE <<'EOFUSAGE'
 DESCRIPTION
-    Helps to manage disk images for single board computers: create/change, flash, mount.
+    Helps to manage disk images for single board computers: create, flash, mount, modify.
 
 USAGE
     pi-img [--config CONFIG] [ACTION] [OPTIONS]
@@ -61,7 +61,7 @@ ACTION
         alternatives will be used instead.
 
     solve-deps
-        Experimantal! Only for deb-based OS.
+        Experimental! Only for deb-based OS.
         Find and install required packages for the script.
         Current version just install predefined list of packages without
         attempt to find necessary list by comparison tool and package.
@@ -94,18 +94,22 @@ OPTIONS
         Some options are useless with some actions so takes no effect.
 
     --config, -c CONFIG
-        Must be the first argument if specified, even before action!
+        Must be the first argument if specified, before ACTION!
         Options from config file overrides script defaults.
 
         To overwrite default options in config file you need to convert option
-        name to upper case and replace "-" with "_". E.g. "--work-dir
-        './work'" will be "WORK_DIR='./work'".
+        name to upper case and replace "-" with "_", e.g.:
+            --work-dir './work'
+        will be
+            WORK_DIR='./work'
         You also may want to see "Defaults" section in the script sources.
+        You must follow bash syntax in config file, it will be sourced after
+        script defaults initialization.
 
         Defaults to /etc/pi-img.conf
 
     --work-dir, -w WORK_DIR
-        Work dir. The script will use it for most temporary or final files.
+        Work dir. The script will use it for some temporary or final files.
         It's also default for base dir for source disk image.
 
         Defaults to current directory ("PWD" shell variable).
@@ -127,7 +131,28 @@ OPTIONS
         Has no default
 
     --rootfs-changes-tarball ROOTFS_CHANGES_TARBALL
-        Not implemented
+        Extract tar archive to rootfs of the image. It's useful if you want to
+        apply exactly the same ownership and permissions as in tar pack.
+
+        To create compatible tarball you may use the command like this:
+            tar cavf ../pi.rootfs-changes.txz ./
+        Assuming that current dir ./ is a directory where required changes present.
+
+        Has no default
+
+    --root-part-num ROOT_PART_NUM
+        Specify rootfs partition number. It required in some cases, so
+        recommended to set it explicitly.
+        Autodetection detects rootfs by the precense of /etc/fstab file.
+
+        Defaults to '' (try to autodetect)
+
+    --boot-part-num BOOT_PART_NUM
+        Specify boot partition number (if any). It required in some cases, so
+        recommended to set it explicitly.
+        Autodetection detects boot partition by parsing /etc/fstab file on rootfs.
+
+        Defaults to '' (try to autodetect)
 
     --source-image-url, -u SOURCE_IMAGE_URL
         URL for source disk image to download.
@@ -220,7 +245,7 @@ OPTIONS
         can significantly speedup flashing. Measure optimal value for your
         cardreader and SD card.
 
-        Defaults to 4M
+        Defaults to 8M
 
     --dd-conv DD_CONV
         dd "conv" comma separated options list for flashing (not for erasing).
@@ -260,7 +285,7 @@ OPTIONS
         suitable only for limited use cases when SD card already zeroed.
 
         If you're going to add some files to the image after creation you
-        probably want to disable shrinking, othervise it can be lack of free
+        probably want to disable shrinking, otherwise it can be lack of free
         space.
 
         Defaults to 0 (do not shrink).
@@ -331,7 +356,7 @@ OPTIONS
         Defaults to 0 (do not pack)
 
     --cert-generate [0|1]
-        Generates self-signed SSL certs after after flashing.
+        Generates self-signed SSL certs after flashing.
         If enabled it generates two pairs of SSL certs inside PI_SSL_DIR:
             main.key
             main.crt
@@ -393,7 +418,7 @@ OPTIONS
         "dtparam=sd_overclock=") you can specify overclock frequency on
         flashing.
 
-        It allows to encrease SD card speed up to ~42MB/s (on 100MHz) while
+        It allows to increase SD card speed up to ~42MB/s (on 100MHz) while
         non-overclocked limit is ~22MB/s (50MHz). It's because RPi do not support UHS
         mode at all but well designed SD cards can increase speed in SD mode:
         https://www.reddit.com/r/raspberry_pi/comments/4aoc3r/how_to_overclock_the_microsd_card_reader_on_a/
@@ -433,7 +458,7 @@ EXAMPLES
     # Note: It can be required to build the image on Pi itself (or compatible
     # host) to enable some image options.
 
-    # Create temporary work dir to be sure you're safe and cd to it
+    # Create temporary work dir if want to be sure you're safe and cd to it
     cd $(mktemp -dp ./)
 
     # Download this script
@@ -450,7 +475,7 @@ EXAMPLES
         --keep-src-image no \
         --tar-pack no \
         --early-boot-ssh yes \
-        --default-pi-password 'SupDup!!!1' \
+        --default-pi-password 'Sup&Dup!!!1' \
         --apt-dist-upgrade 1 \
         --apt-extra-pkgs 'htop vim whatever'
 
@@ -471,7 +496,7 @@ EXAMPLES
     # It may speedup flashing for few % depends on your disk subsystem.
     # Also you can use optimal block size for flashing (may be 8M or higher
     # against default 4M), it also can drop couple of seconds:
-    pi-img flash --img THEIMAGE.img --sdcard /dev/mmcblk0 --dd-bs 8M
+    pi-img flash --img THEIMAGE.img --sdcard /dev/mmcblk0 --dd-bs 16M
 
 
     - Want to apply some changes to existing image without recreation.
@@ -505,9 +530,8 @@ TMP_DIR_DEFAULT_DIRNAME='/tmp'
 PI_UID=1000
 PI_GID=1000
 
-# TODO: avoid hardcoding
 HOST_CPU_ARCH=$(exec -c uname -m)  # CPU arch of the host where the script executed
-TARGET_CPU_ARCH='armv7l'  # CPU arch of the pi where created disk image will be used
+# TARGET_CPU_ARCH='armv7l'  # CPU arch of the pi where created disk image will be used
 # TARGET_ABI='armhf'
 
 # shellcheck disable=2164
@@ -523,7 +547,7 @@ SDCARD=''  # The device name of SD cardreader, empty to ask interactively, can b
 SDCARD_ERASE_ON_FLASH=0  # If SD card need to be erased before flashing (mostly for security reasons)
 SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'  # Source device to use for erasing, /dev/zero and /dev/urandom are reasonable choices
 
-DD_BS=4M  # Default dd block size (only for some dd commands), 1M is 1048576
+DD_BS=8M  # Default dd block size (only for some dd commands), 1M is 1048576
 DD_CONV=''  # Default dd conv option (only for flash dd command)
 DD_STATUS=''  # Choice depends on INTERACTIVE value and dd version
 DD_CONV_FSYNC='fsync'  # Can be fsync or fdatasync or empty
@@ -559,9 +583,9 @@ FLASH=1
 LOG_SCRIPT_VERSION=1  # Show the script version on each run
 SHRINK_ROOTFS=0  # Shrink rootfs on image creation to speedup flashing
 
-# Suppose that rootfs is on 2nd partition, it's a must for now
-# TODO: autodetect all partitions and their type
-ROOTFS_PART_NUM=2
+# Empty values to autodetect
+ROOT_PART_NUM=''
+BOOT_PART_NUM=''
 
 SD_OVERCLOCK=0
 
@@ -622,6 +646,10 @@ quit() {
             log "OK: $*" >&2
         fi
     fi
+
+    # TODO: check if dir is empty to avoid useless log output, --ignore-fail-on-non-empty is not usitable because suppress all error messagess.
+    [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+
     sync
     case "${ACTION}" in
         create|flash)
@@ -632,19 +660,6 @@ quit() {
     esac
     exit "$1"
 }
-
-
-##
-# Suppress some message specified as a pattern on standard input.
-# First argument is a pattern to supress.
-# Pattern is interpreted as in ${parameter/pattern/string}
-##
-# suppress_progress_msg() {
-#     # TODO: seems doesn't work
-#     local l
-#     while read -rd $'\r' l || [[ -n $l ]]; do echo -n $'\r'"${l/$1}      "; done
-#     echo
-# }
 
 
 ##
@@ -720,7 +735,6 @@ reread_partitions() {
         quit 1 'reread_partitions: invalid syntax: non empty argument required'
     fi
 
-    # TODO: add command line option to specify if automounting tool is enabled without prediction
     if [[ -z "${AUTOMOUNTING_ENABLED}" ]]; then
         # Check if automounting tool enabled for this SD card
         log 'Trying to detect automounting tool...'
@@ -816,56 +830,70 @@ bpwgen() {
 # Gather image info.
 #
 # Set globals in conjunction with sfdisk output:
+#   IMG_BS           - block size (always 512)
+#   IMG_PART         - array with partitions basenames
 #   IMG_PART_START   - array with partitions start blocks
 #   IMG_PART_END     - array with partitions end blocks
 #   IMG_PART_SECTORS - array with partitions sectors count
 #   IMG_PART_SIZE    - array with partitions human readable sizes
-#   IMG_PART_ID      - array with partitions type id (e.g.: 'c', '83', etc)
 #   IMG_PART_TYPE    - array with partitions types (e.g.: "W95 FAT32 (LBA)", "Linux")
-#   IMG_PART         - array with partitions basenames
-#   IMG_BS           - image block size
+# Also tries to autodetect ROOT_PART_NUM and BOOT_PART_NUM
 ##
 gather_image_info() {
-    local IMG p s e sc sz Id Type
+    local IMG p s e sc sz tp
     IMG=$1
     log 'Gather image info'
     sync
     # To be sure not to reuse existing values
-    unset IMG_BS
+    # unset IMG_BS
+    IMG_BS=512  # Always 512 bytes because of *nix agreement
+    IMG_PART=()
     IMG_PART_START=()
     IMG_PART_END=()
     IMG_PART_SECTORS=()
     IMG_PART_SIZE=()
-    IMG_PART_ID=()
     IMG_PART_TYPE=()
-    IMG_PART=()
 
+    # TODO: handle not sequential partition numbers here and in other places
     {
-        # shellcheck disable=2162
-        read -a IMG_BS; IMG_BS=${IMG_BS[3]}
-        # shellcheck disable=2034,2162
-        while read p s e sc sz Id Type; do
+        read  # Ignore first line with headers
+        while read -r p s e sc sz tp; do
+            IMG_PART+=("${p##*/}")  # basename only, not full path
             IMG_PART_START+=("${s}")
             IMG_PART_END+=("${e}")
             IMG_PART_SECTORS+=("${sc}")
             IMG_PART_SIZE+=("${sz}")
-            IMG_PART_ID+=("${Id}")
-            IMG_PART_TYPE+=("${Type}")
-            IMG_PART+=("${p##*/}")  # basename only, not full path
+            IMG_PART_TYPE+=("${tp}")
         done
-    } < <(LC_ALL=C sfdisk -l -- "${IMG}" | grep -e '^I/O' -e "^${IMG}[0-9]" | tr -d '*' | tr -s ' ')
+    } < <(LC_ALL=C exec sudo sfdisk --color=never -q -l -o device,start,end,sectors,size,type -- "${IMG}")
 
     # TODO: implement deeper verification
     if  [[ -z "${IMG_BS}" \
+        || -z "${IMG_PART[*]}" \
         || -z "${IMG_PART_START[*]}" \
         || -z "${IMG_PART_END[*]}" \
         || -z "${IMG_PART_SECTORS[*]}" \
         || -z "${IMG_PART_SIZE[*]}" \
-        || -z "${IMG_PART_ID[*]}" \
         || -z "${IMG_PART_TYPE[*]}" \
-        || -z "${IMG_PART[*]}" \
         ]]; then
         quit 1 'Failed to gather image info'
+    fi
+
+    # Trying to autodetect ROOT_PART_NUM
+    if [[ -z "${ROOT_PART_NUM}" ]]; then
+        if ((${#IMG_PART[@]} == 1)); then
+            log 'Single partition image, treat as rootfs.'
+            ROOT_PART_NUM=1
+        elif ((${#IMG_PART[@]} == 2)); then
+            if  [[ "${IMG_PART_TYPE[0]}" =~ ^.*FAT.*$ \
+                && "${IMG_PART_TYPE[1]}" == 'Linux' \
+                ]]; then
+                # FAT and Linux partitions
+                log 'Double partitions image fat+linux, treat as boot+rootfs.'
+                [[ -z "${BOOT_PART_NUM}" ]] && BOOT_PART_NUM=0
+                ROOT_PART_NUM=1
+            fi
+        fi
     fi
 }
 
@@ -873,13 +901,13 @@ gather_image_info() {
 ##
 # Mount all partitions from the image
 #
-# Set globals:
-#   BOOT_MOUNTPOINT
-#   ROOTFS_MOUNTPOINT
-#   IMG_MOUNTPOINTS
+# Also set globals:
+#   IMG_MOUNTPOINTS[@]
+#   IMG_ROOT_MOUNTPOINT
+#   IMG_BOOT_MOUNTPOINT
 ##
 mount_img() {
-    local IMG IMG_PART_START IMG_PART_SECTORS IMG_PART IMG_BS p s e sc tmp
+    local IMG i entry mp _
     IMG=$1
     if [[ -z "${IMG}" ]]; then
         log 'ERROR: Cannot mount: No image specified'
@@ -890,28 +918,69 @@ mount_img() {
 
     ask_for_sudo_password
 
-    IMG_MOUNTPOINTS=("${IMG_PART[@]/#/${MOUNT_DIR}/}")  # All image mountpoints
+    IMG_MOUNTPOINTS=("${IMG_PART[@]/#/${MOUNT_DIR}/}")  # All image mountpoints, full paths.
 
     # Try to unmount if already mounted
     umount_img "${IMG}"
 
     log 'Creating path(s) for mounting (if required)'
-    mkdir -vp "${IMG_MOUNTPOINTS[@]}" 2>/dev/null || sudo mkdir -vp "${IMG_MOUNTPOINTS[@]}" || quit 1 'Failed to create path(s) for mounting'
+            mkdir -vp "${IMG_MOUNTPOINTS[@]}" 2>/dev/null \
+    || sudo mkdir -vp "${IMG_MOUNTPOINTS[@]}" \
+    || quit 1 'Failed to create path(s) for mounting'
 
     log 'Mounting all partitions from the disk image:'
     for ((i=0;i<${#IMG_PART[@]};++i)); do
         sudo mount -v -o loop,rw,offset=$((IMG_PART_START[i]*IMG_BS)),sizelimit=$((IMG_PART_SECTORS[i]*IMG_BS)) "${IMG}" "${IMG_MOUNTPOINTS[$i]}" || quit 6 "Failed to mount partition $((++i))"
     done
 
-    # Set useful aliases for first two IMG_MOUNTPOINTS items
-    # TODO: Verify that it's really boot and rootfs partitions
-    BOOT_MOUNTPOINT=${IMG_MOUNTPOINTS[0]}  # First partition
-    ROOTFS_MOUNTPOINT=${IMG_MOUNTPOINTS[1]}  # Second partition
+    # Trying to autodetect ROOT_PART_NUM and corresponding BOOT_PART_NUM by the presence of /etc/fstab
+    # TODO: find proper way to detect root and boot partitions
+    if [[ -z "${ROOT_PART_NUM}" ]]; then
+        for ((i=0;i<${#IMG_MOUNTPOINTS[@]};++i)); do
+            if [[ -f "${IMG_MOUNTPOINTS[$i]}/etc/fstab" ]]; then
+                ROOT_PART_NUM=$((++i))
+                if [[ -z "${BOOT_PART_NUM}" ]]; then
+                    while read -r entry mp _; do
+                        if [[ "${mp}" == '/boot' && "${entry%%=*}" == 'PARTUUID' ]]; then
+                            BOOT_PART_NUM=${entry##*-}  # Only the part after -
+                            BOOT_PART_NUM=${BOOT_PART_NUM#0}  # Remove leading 0 if any
+                            # Expect sequential partition numbers only
+                            if ! [[ "${BOOT_PART_NUM}" =~ ^[1-9][0-9]*$ ]] && ((BOOT_PART_NUM <= ${#IMG_MOUNTPOINTS[@]})); then
+                                BOOT_PART_NUM=''
+                            fi
+                        fi
+                    done <"${IMG_MOUNTPOINTS[$i]}/etc/fstab"
+                fi
+                break
+            fi
+        done
+        if [[ -z "${ROOT_PART_NUM}" ]]; then
+            log "WARNING: Failed to detect rootfs partition number, set it by --root-part-num option."
+        fi
+    fi
 
-    # TODO: also test if ${ROOTFS_MOUNTPOINT}/boot is empty
-    if [[ -n "${BOOT_MOUNTPOINT}" && -n "${ROOTFS_MOUNTPOINT}" && -d "${ROOTFS_MOUNTPOINT}/boot" ]]; then
+
+    # Set useful aliases for rootfs and boot IMG_MOUNTPOINTS if any
+    if ((ROOT_PART_NUM)); then
+        IMG_ROOT_MOUNTPOINT=${IMG_MOUNTPOINTS[$((ROOT_PART_NUM-1))]}
+    else
+        IMG_ROOT_MOUNTPOINT=''
+    fi
+    if ((BOOT_PART_NUM && BOOT_PART_NUM != ROOT_PART_NUM)); then
+        IMG_BOOT_MOUNTPOINT=${IMG_MOUNTPOINTS[$((BOOT_PART_NUM-1))]}
+    else
+        IMG_BOOT_MOUNTPOINT=''
+    fi
+
+    # Be sure that rootfs is the last in this array to avoid unmounting issues
+    if [[ -n "${IMG_ROOT_MOUNTPOINT}" && "${IMG_MOUNTPOINTS[-1]}" != "${IMG_ROOT_MOUNTPOINT}" ]]; then
+        # TODO: implement
+        :
+    fi
+
+    if [[ -n "${IMG_BOOT_MOUNTPOINT}" && -n "${IMG_ROOT_MOUNTPOINT}" && -d "${IMG_ROOT_MOUNTPOINT}/boot" ]]; then
         log 'Mount (bind) boot partition to /boot dir of rootfs'
-        sudo mount --bind "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}/boot" || log 'ERROR: Failed to mount boot partition to /boot dir of rootfs'
+        sudo mount --bind "${IMG_BOOT_MOUNTPOINT}" "${IMG_ROOT_MOUNTPOINT}/boot" || log 'ERROR: Failed to mount boot partition to /boot dir of rootfs'
     fi
 
     return 0
@@ -935,23 +1004,24 @@ umount_img() {
         # shellcheck disable=2162
         while read l; do
             tmploop+=("${l%%: *}")
-        done < <(losetup -j "${IMG}" | sort)  # "sort" required to unmount boot partition first
+        done < <(losetup -j "${IMG}" | sort)  # "sort" required to unmount rootfs partition last
         if [[ -n "${tmploop[*]}" ]]; then
             if [[ "$2" == '--rmdir' ]]; then
                 # TODO: Fix the case when it's more than 10 loop devices
                 tmpmp=()
                 # shellcheck disable=2034,2068,2162
-                while read l m n; do tmpmp+=("${m}"); done < <(exec -c grep ${tmploop[@]/#/-e ^} /proc/mounts)
+                while read l m n; do
+                    tmpmp+=("${m}")
+                done < <(exec -c grep ${tmploop[@]/#/-e ^} /proc/mounts)
             fi
             log 'Unmounting already mounted partitions assosiated with the image:'
             # sudo umount -vA "${tmploop[@]}" || return $?
             # Use separate command for each loop device because "umount -A" does not work correctly with multiple devices on single command
             for tmp in "${tmploop[@]}"; do
-                sudo umount -vA "${tmp}" || return $?
+                sudo umount -v --all-targets "${tmp}" || return $?
             done
             if [[ "$2" == '--rmdir' ]]; then
                 log 'Removing empty mountpoints (keep if non-empty):'
-                # TODO: be sure that */boot partitions will not be deleted for sure.
                 sudo rmdir -v -- "${tmpmp[@]}"
             fi
         else
@@ -960,7 +1030,7 @@ umount_img() {
         fi
     elif [[ -n "${IMG_MOUNTPOINTS[*]}" ]]; then  # Unmount all existing image mount points
         log 'Unmounting image partitions:'
-        sudo umount -vR "${IMG_MOUNTPOINTS[@]}" || return $?
+        sudo umount -v --all-targets --recursive "${IMG_MOUNTPOINTS[@]}" || return $?
         if [[ "$1" == '--rmdir' ]]; then
             log 'Removing empty mountpoints (keep if non-empty):'
             sudo rmdir -v -- "${IMG_MOUNTPOINTS[@]}"
@@ -977,7 +1047,7 @@ umount_img() {
 # Generally works with globall variables.
 ##
 create_image() {
-    local tmp o i v lo out
+    local tmp o i v l m t out
 
     log "Current work dir: ${WORK_DIR}"
     cd "${WORK_DIR}" || quit 1 "Failed to change directory to WORK_DIR: ${WORK_DIR}"
@@ -1031,12 +1101,7 @@ create_image() {
     fi
 
     ## Check if the image has 2nd partition
-    # # Commented because not all "file"` versions support extended output, use sfdisk instead.
-    # out=$(exec -c file -- "${RASPBIAN_NAME}")
-    # if [[ -n "${out/* partition 2 */}" ]]
-    #     quit 4 "Raspbian image is broken (at least has no 2nd partition): ${out}"
-    # fi
-    out=$(exec -c sfdisk -l -- "${RASPBIAN_NAME}")
+    out=$(exec -c sfdisk --color=never -l -- "${RASPBIAN_NAME}")
     if ! grep -qe "^${RASPBIAN_NAME}2 " <<<"${out}"; then
         quit 4 "Raspbian image is broken (has no 2nd partition or failed to check it)"
     fi
@@ -1075,17 +1140,17 @@ create_image() {
 
     ## Check rootfs before mounting
     log 'Create loop device for rootfs partition'
-    unset ROOTFS_LODEV
-    ROOTFS_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOTFS_PART_NUM-1]*IMG_BS)) "${IMG}")
+    unset ROOT_LODEV
+    ROOT_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOT_PART_NUM-1]*IMG_BS)) "${IMG}")
     # shellcheck disable=2181
-    [[ $? -eq 0 && -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+    [[ $? -eq 0 && -n "${ROOT_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
 
     log 'Check rootfs filesystem for errors and preen'
-    sudo e2fsck -pf "${ROOTFS_LODEV}" || { sudo losetup -d "${ROOTFS_LODEV}"; quit 1 'Failed to preen filesystem'; }
+    sudo e2fsck -pf "${ROOT_LODEV}" || { sudo losetup -d "${ROOT_LODEV}"; quit 1 'Failed to preen filesystem'; }
     sync
 
     log 'Detach rootfs loop device'
-    sudo losetup -d "${ROOTFS_LODEV}" || log 'WARNING: Failed to detach rootfs loop device'
+    sudo losetup -d "${ROOT_LODEV}" || log 'WARNING: Failed to detach rootfs loop device'
 
     mount_img "${IMG}"
 
@@ -1094,43 +1159,47 @@ create_image() {
     if [[ -n "${PI_USERNAME}" && "${PI_USERNAME}" != 'pi' ]]; then
         log "Rename \"pi\" user to \"${PI_USERNAME}\" (keep UID) and change all related files/dirs except /etc/sudoers.d/010_pi-nopasswd"
         # shellcheck disable=1083
-        sudo mv -vf "${ROOTFS_MOUNTPOINT}/home/"{pi,"${PI_USERNAME}"}
-        sudo sed -i -e "s|^pi:|${PI_USERNAME}:|" -e "s|:/home/pi:|:/home/${PI_USERNAME}:|" "${ROOTFS_MOUNTPOINT}/etc/"{passwd,shadow}
+        sudo mv -vf "${IMG_ROOT_MOUNTPOINT}/home/"{pi,"${PI_USERNAME}"}
+        sudo sed -i -e "s|^pi:|${PI_USERNAME}:|" -e "s|:/home/pi:|:/home/${PI_USERNAME}:|" "${IMG_ROOT_MOUNTPOINT}/etc/"{passwd,shadow}
         sudo sed -i \
             -e "s|^pi:|${PI_USERNAME}:|g" \
             -e "s|:pi\$|:${PI_USERNAME}|g" \
             -e "s|:pi,|:${PI_USERNAME},|g" \
             -e "s|,pi,|,${PI_USERNAME},|g" \
             -e "s|,pi\$|,${PI_USERNAME}|g" \
-            "${ROOTFS_MOUNTPOINT}/etc/"{group,gshadow}
-        sudo sed -i -e "s|^pi:|${PI_UID}:|" "${ROOTFS_MOUNTPOINT}/etc/subuid"
-        sudo sed -i -e "s|^pi:|${PI_GID}:|" "${ROOTFS_MOUNTPOINT}/etc/subgid"
-        echo changed: $'\n'"  ${ROOTFS_MOUNTPOINT}/etc/"{passwd,shadow,group,gshadow,subuid,subgid}
+            "${IMG_ROOT_MOUNTPOINT}/etc/"{group,gshadow}
+        sudo sed -i -e "s|^pi:|${PI_UID}:|" "${IMG_ROOT_MOUNTPOINT}/etc/subuid"
+        sudo sed -i -e "s|^pi:|${PI_GID}:|" "${IMG_ROOT_MOUNTPOINT}/etc/subgid"
+        echo changed: $'\n'"  ${IMG_ROOT_MOUNTPOINT}/etc/"{passwd,shadow,group,gshadow,subuid,subgid}
     fi
 
     if [[ -n "${ROOTFS_CHANGES_DIR}" ]]; then
-        log "Applying rootfs changes from: ${ROOTFS_CHANGES_DIR}"
+        log "Applying rootfs changes from this dir: ${ROOTFS_CHANGES_DIR}"
         log "INFO: All copied files will be owned by root and has the same permissions"
 
         # If hidden files present dotglob required
-        # shopt -q dotglob || shopt -s dotglob  # TODO: need to revert after cp if changed
-        sudo cp -r --preserve=mode --no-preserve=ownership,timestamps -t "${ROOTFS_MOUNTPOINT}" "${ROOTFS_CHANGES_DIR}/"* || quit 7 'Failed to apply changes to rootfs of disk image'
+        # shopt -q dotglob || shopt -s dotglob  # Set dotglob if not set globally, need to revert after cp if changed.
+        sudo cp -r --preserve=mode --no-preserve=ownership,timestamps -t "${IMG_ROOT_MOUNTPOINT}" "${ROOTFS_CHANGES_DIR}/"* || quit 7 'Failed to apply changes to rootfs'
     fi
-    # TODO: do similar for ROOTFS_CHANGES_TARBALL
+
+    if [[ -n "${ROOTFS_CHANGES_TARBALL}" ]]; then
+        log "Applying rootfs changes from tarball: ${ROOTFS_CHANGES_TARBALL}"
+        sudo tar xaf "${ROOTFS_CHANGES_TARBALL}" -C "${IMG_ROOT_MOUNTPOINT}" || quit 7 'Failed to apply tarball changes to rootfs'
+    fi
 
     if [[ -n "${PI_IMAGE_VERSION_FILE}" ]]; then
         log "Write the image version ${PI_IMAGE_VERSION} to ${PI_IMAGE_VERSION_FILE}"
-        echo "${PI_IMAGE_VERSION}" | sudo tee "${ROOTFS_MOUNTPOINT}${PI_IMAGE_VERSION_FILE}" &>/dev/null
+        echo "${PI_IMAGE_VERSION}" | sudo tee "${IMG_ROOT_MOUNTPOINT}${PI_IMAGE_VERSION_FILE}" &>/dev/null
     fi
 
     log 'Mount temporary directory for apt cache to save disk space'
     sudo mkdir -p "${TMP_DIR}/cache/apt"
-    sudo mount -o bind "${TMP_DIR}/cache/apt" "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+    sudo mount -o bind "${TMP_DIR}/cache/apt" "${IMG_ROOT_MOUNTPOINT}/var/cache/apt"
 
     log 'Implementing changes in chroot environment...'
     # TODO: (?) Avoid chroot to support build on any host avoiding "the same CPU arch" restriction.
-    #       Candidates: qemu, debootstrap, dpkg --root
-    sudo chroot "${ROOTFS_MOUNTPOINT}" /bin/bash -s <<EOFCHROOTCMD
+    #       Candidates to consider: qemu, debootstrap, dpkg --root
+    sudo chroot "${IMG_ROOT_MOUNTPOINT}" /bin/bash -s <<EOFCHROOTCMD
 # This block is a root shell inside the image rootfs partition
 # Boot partition (if any) have to be mounted/binded to corresponding dir.
 # Variables with escaped dollar sign are local for chroot.
@@ -1188,16 +1257,16 @@ exit 0
 EOFCHROOTCMD
     # shellcheck disable=2162,2181
     if (($?)); then
-        log "ERROR: Failed to chroot! Host and target CPU architectures may be incompatible (${HOST_CPU_ARCH} and ${TARGET_CPU_ARCH})."
-        sudo umount -p "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+        log "ERROR: Failed to chroot! This host and image target CPU architectures may be incompatible."
+        sudo umount -p "${IMG_ROOT_MOUNTPOINT}/var/cache/apt"
         sudo rm -rvf -- "${TMP_DIR}/cache"
         quit 222
     fi
 
     # log 'Clean apt cache on the image'
-    # sudo apt-get -o RootDir="${ROOTFS_MOUNTPOINT}" clean
+    # sudo apt-get -o RootDir="${IMG_ROOT_MOUNTPOINT}" clean
     # # # Analogue of 'apt-get clean' in chroot
-    # # for f in "${ROOTFS_MOUNTPOINT}/var/cache/apt/archives/"{,partial/}*; do
+    # # for f in "${IMG_ROOT_MOUNTPOINT}/var/cache/apt/archives/"{,partial/}*; do
     # #     case "${f##*/}" in
     # #         lock|partial|'*') ;;
     # #         *) sudo rm -rvf -- "${f}";;
@@ -1205,50 +1274,66 @@ EOFCHROOTCMD
     # # done
 
     log 'Unmount temporary directory for apt cache and clean'
-    sudo umount -p "${ROOTFS_MOUNTPOINT}/var/cache/apt"
+    sudo umount -p "${IMG_ROOT_MOUNTPOINT}/var/cache/apt"
     sudo rm -rvf -- "${TMP_DIR}/cache"
 
-    case "${EARLY_BOOT_SSH}" in
-        0)  log 'Force disabling SSH server on early boot stage'
-            [[ -f "${BOOT_MOUNTPOINT}/ssh" ]] && sudo rm -vf -- "${BOOT_MOUNTPOINT}/ssh"
-            ;;
-        1)  log 'Force enabling SSH server on early boot stage'
-            [[ -f "${BOOT_MOUNTPOINT}/ssh" ]] || sudo touch "${BOOT_MOUNTPOINT}/ssh"
-            ;;
-    esac
+    if [[ -n "${EARLY_BOOT_SSH}" && -d "${IMG_BOOT_MOUNTPOINT}" ]]; then
+        case "${EARLY_BOOT_SSH}" in
+            0)  log 'Force disabling SSH server on early boot stage'
+                [[ -f "${IMG_BOOT_MOUNTPOINT}/ssh" ]] && sudo rm -vf -- "${IMG_BOOT_MOUNTPOINT}/ssh"
+                ;;
+            1)  log 'Force enabling SSH server on early boot stage'
+                [[ -f "${IMG_BOOT_MOUNTPOINT}/ssh" ]] || sudo touch "${IMG_BOOT_MOUNTPOINT}/ssh"
+                ;;
+        esac
+    elif [[ -n "${EARLY_BOOT_SSH}" && -z "${IMG_BOOT_MOUNTPOINT}" ]]; then
+        log "WARNING: Failed to configure EARLY_BOOT_SSH: boot mountpoint does not exist"
+    fi
 
     if [[ -n "${DEFAULT_PI_PASSWORD}" ]]; then
         log "Change \"${PI_USERNAME}\" user password to: ${DEFAULT_PI_PASSWORD}"
-        sudo sed -i "s|^${PI_USERNAME}:[^:]*:|${PI_USERNAME}:$(exec -c mkpasswd -m sha-512 -s <<<"${DEFAULT_PI_PASSWORD}"):|" "${ROOTFS_MOUNTPOINT}/etc/shadow"
+        sudo sed -i "s|^${PI_USERNAME}:[^:]*:|${PI_USERNAME}:$(exec -c mkpasswd -m sha-512 -s <<<"${DEFAULT_PI_PASSWORD}"):|" "${IMG_ROOT_MOUNTPOINT}/etc/shadow"
     fi
 
     log 'Be sure ~/.ssh folder exists for default user with correct permissions'
-    sudo mkdir -p "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
-    sudo chown "${PI_UID}:${PI_GID}" "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
-    sudo chmod 700 "${ROOTFS_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+    sudo mkdir -p "${IMG_ROOT_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+    sudo chown "${PI_UID}:${PI_GID}" "${IMG_ROOT_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
+    sudo chmod 700 "${IMG_ROOT_MOUNTPOINT}/home/${PI_USERNAME}/.ssh"
 
     log 'Obtaining Linux kernel release of the image...'
-    kernel_img="${BOOT_MOUNTPOINT}/kernel7.img"
-    kernel_skip=$(exec -c grep -abo $'\x1f\x8b\x08\x00\x00\x00\x00\x00' "${kernel_img}" 2>/dev/null)
-    kernel_skip=${kernel_skip%%:*}
-    # Calculate max bs to speedup dd read
-    for ((bs=1024;bs>1;bs/=2)); do ((kernel_skip/bs*bs == kernel_skip)) && break; done
-    kernel_release=$(dd "if=${kernel_img}" "bs=${bs}" "skip=$((kernel_skip/bs))" | zgrep -aom1 'Linux version [^ ]\+' 2>/dev/null)
-    kernel_release=${kernel_release#Linux version }  # Have to be the same as 'uname -r' in chroot
-    if ! [[ "${kernel_release}" =~ ^[0-9a-z._-+]$ ]]; then
-        log "Linux kernel release: ${kernel_release}"
-        log 'Remove unused directories with kernel modules:'
-        for i in "${ROOTFS_MOUNTPOINT}"/lib/modules/*; do
-            if [[ "${kernel_release}" != "${i##*/}" ]]; then
-                sudo rm -rf -- "${i:?}"/*  # Avoid verbose deletion
-                sudo rm -rvf -- "${i:?}"  # Verbose deletion only for dir
-            fi
-        done
+    # TODO: now it works with Raspbian only
+    if [[ -n "${IMG_BOOT_MOUNTPOINT}" && -f "${IMG_BOOT_MOUNTPOINT}/kernel7.img" ]]; then
+        kernel_img="${IMG_BOOT_MOUNTPOINT}/kernel7.img"
+    elif [[ -f "${IMG_ROOT_MOUNTPOINT}/kernel7.img" ]]; then
+        kernel_img="${IMG_ROOT_MOUNTPOINT}/kernel7.img"
     else
-        log "Linux kernel release is unknown"
+        # TODO: try to find kernel image thoroughly
+        kernel_img=''
+    fi
+    if [[ -n "${kernel_img}" ]]; then
+        kernel_skip=$(exec -c grep -abo $'\x1f\x8b\x08\x00\x00\x00\x00\x00' "${kernel_img}" 2>/dev/null)
+        kernel_skip=${kernel_skip%%:*}
+        # Calculate max bs to speedup dd read
+        for ((bs=1024;bs>1;bs/=2)); do ((kernel_skip/bs*bs == kernel_skip)) && break; done
+        kernel_release=$(dd "if=${kernel_img}" "bs=${bs}" "skip=$((kernel_skip/bs))" | zgrep -aom1 'Linux version [^ ]\+' 2>/dev/null)
+        kernel_release=${kernel_release#Linux version }  # Have to be the same as 'uname -r' in chroot
+        if ! [[ "${kernel_release}" =~ ^[0-9a-z._-+]$ ]]; then
+            log "Linux kernel release: ${kernel_release}"
+            log 'Remove unused directories with kernel modules:'
+            for i in "${IMG_ROOT_MOUNTPOINT}"/lib/modules/*; do
+                if [[ "${kernel_release}" != "${i##*/}" ]]; then
+                    sudo rm -rf -- "${i:?}"/*  # Avoid verbose deletion
+                    sudo rm -rvf -- "${i:?}"  # Verbose deletion only for dir
+                fi
+            done
+        else
+            log "Linux kernel release is unknown"
+        fi
+    else
+        log "Linux kernel image not found"
     fi
 
-    # read -r PI_IMAGE_DEBIAN_VERSION_MAJOR <"${ROOTFS_MOUNTPOINT}/etc/debian_version"
+    # read -r PI_IMAGE_DEBIAN_VERSION_MAJOR <"${IMG_ROOT_MOUNTPOINT}/etc/debian_version"
     # PI_IMAGE_DEBIAN_VERSION_MAJOR=${PI_IMAGE_DEBIAN_VERSION_MAJOR%%[/\.]*}
     # PI_IMAGE_DEBIAN_VERSION_MAJOR=${PI_IMAGE_DEBIAN_VERSION_MAJOR,,}  # To lowercase
     # log "Image major Debian version is ${PI_IMAGE_DEBIAN_VERSION_MAJOR}"
@@ -1262,33 +1347,39 @@ EOFCHROOTCMD
     # esac
 
     # log 'Remove files related to non RPi 3B from boot partition (to decrease final image size)'
-    # sudo rm -vf -- "${BOOT_MOUNTPOINT}/"{bcm270*.dtb,bcm2710-rpi-cm3.dtb,kernel.img}
+    # sudo rm -vf -- "${IMG_BOOT_MOUNTPOINT}/"{bcm270*.dtb,bcm2710-rpi-cm3.dtb,kernel.img}
 
     # log 'Truncate logs and other history files'
-    # sudo find "${ROOTFS_MOUNTPOINT}" -type f -iname '*.log' -o -name '.wget-hsts' -exec truncate -cs0 {} \; -print
+    # sudo find "${IMG_ROOT_MOUNTPOINT}" -type f -iname '*.log' -o -name '.wget-hsts' -exec truncate -cs0 {} \; -print
 
     # log 'Remove existing ssh server keys (will be regenerated on first start)'
-    # sudo rm -vf -- "${ROOTFS_MOUNTPOINT}"/etc/ssh/ssh_host_*
+    # sudo rm -vf -- "${IMG_ROOT_MOUNTPOINT}"/etc/ssh/ssh_host_*
 
     log 'Zeroying empty space to minimize real size of the final sparse image...'
-    if hash zerofree 2>/dev/null; then  # If zerofree utility exists (faster)
-        # TODO: do for all ${IMG_MOUNTPOINTS[@]}" if supported
-        # rootfs
-        lo=$(exec -c grep -m1 -F -e " ${ROOTFS_MOUNTPOINT} " </proc/mounts)
-        lo=${lo%% ${ROOTFS_MOUNTPOINT} *}
-        ((INTERACTIVE)) && v='-v' || v=''
-        sudo mount -o remount,ro "${lo}"
-        sudo zerofree $v "${lo}"  # Require readonly on unmounted device
+    if hash zerofree 2>/dev/null; then  # If zerofree utility exists (faster for ext* filesystems)
+        ((INTERACTIVE)) && v='-v' || v=''  # v is verbose option for zerofree
+        read -rd '' proc_mounts </proc/mounts
+        for o in "${IMG_MOUNTPOINTS[@]}"; do
+            # Get filesystem type: ${t}
+            while read l m t _; do  # lodev mountpoint fstype
+                [[ "${m}" == "${o}" ]] && break
+            done <<<"${proc_mounts}"
 
-        # boot
-        # LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${BOOT_MOUNTPOINT}/zeroes.tmp" status=none "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
-        LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${BOOT_MOUNTPOINT}/zeroes.tmp" status=none "conv=${DD_CONV_FSYNC}"
-        sudo rm -vf -- "${BOOT_MOUNTPOINT}/zeroes.tmp"
+            if [[ -n "${l}" ]] \
+            && [[ "${t}" == ext4 || "${t}" == ext3 || "${t}" == ext2 ]]; then
+                # zerofree requires readonly or unmounted device
+                sudo mount -o remount,ro "${l}"
+                sudo zerofree $v "${l}"
+            else
+                sudo dd if=/dev/zero "of=${o}/0.tmp" "bs=${IMG_BS}" ${DD_STATUS} "conv=${DD_CONV_FSYNC}"
+                sudo rm -vf -- "${o}/0.tmp"
+            fi
+            unset l m t
+        done
     else  # No zerofree utility
         for o in "${IMG_MOUNTPOINTS[@]}"; do
-            # LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${!o}/zeroes.tmp" ${DD_STATUS} "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
-            LC_ALL=C sudo dd bs=512 if=/dev/zero "of=${!o}/zeroes.tmp" ${DD_STATUS} "conv=${DD_CONV_FSYNC}"
-            sudo rm -vf -- "${!o}/zeroes.tmp"
+            sudo dd if=/dev/zero "of=${o}/0.tmp" "bs=${IMG_BS}" ${DD_STATUS} "conv=${DD_CONV_FSYNC}"
+            sudo rm -vf -- "${o}/0.tmp"
         done
     fi
 
@@ -1296,8 +1387,7 @@ EOFCHROOTCMD
     fallocate -vd -- "${IMG}" || log 'ERROR: Failed to sparsify'
 
     umount_img "${IMG}" --rmdir || log 'ERROR: Failed to unmount image partitions.'
-    # sudo rmdir -v -- "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
-    [[  "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+    # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
 
     if ((SHRINK_ROOTFS)); then
         log 'Shrinking rootfs filesystem and partition to minimize final image virtual size...'
@@ -1310,28 +1400,28 @@ EOFCHROOTCMD
         # for ((i=0;i<${#IMG_PART_START[@]};++i)); do
         #     LODEV+=("$(exec -c sudo losetup -f --show -o $((IMG_PART_START[i]*IMG_BS)) "${IMG}")")
         # done
-        # ROOTFS_LODEV=${LODEV[$((ROOTFS_PART_NUM-1))]}
-        # [[ -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+        # ROOT_LODEV=${LODEV[$((ROOT_PART_NUM-1))]}
+        # [[ -n "${ROOT_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
         log 'Create loop device for rootfs partition'
-        unset ROOTFS_LODEV
-        ROOTFS_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOTFS_PART_NUM-1]*IMG_BS)) "${IMG}")
-        [[ -n "${ROOTFS_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
+        unset ROOT_LODEV
+        ROOT_LODEV=$(exec -c sudo losetup -f --show -o $((IMG_PART_START[ROOT_PART_NUM-1]*IMG_BS)) "${IMG}")
+        [[ -n "${ROOT_LODEV}" ]] || quit 1 'Failed to create loop device for rootfs'
 
         log 'Check rootfs filesystem for errors and preen'
-        sudo e2fsck -pf "${ROOTFS_LODEV}" || quit 1 'Failed to preen rootfs'
+        sudo e2fsck -pf "${ROOT_LODEV}" || quit 1 'Failed to preen rootfs'
         sync
 
         log 'Shrink rootfs filesystem'
-        sudo resize2fs -M "${ROOTFS_LODEV}" | grep -v -e '^resize2fs ' -e '^$'
+        sudo resize2fs -M "${ROOT_LODEV}" | grep -v -e '^resize2fs ' -e '^$'
         ((PIPESTATUS[0]==0)) || quit 1 'Failed to shrink rootfs filesystem'
         sync
 
         log 'Shrink rootfs partition'
         # shellcheck disable=2162
-        { read _ _ BC; read _ _ BS; } < <(sudo tune2fs -l "${ROOTFS_LODEV}" | grep -e '^Block count:' -e '^Block size:')
+        { read _ _ BC; read _ _ BS; } < <(LC_ALL=C sudo tune2fs -l "${ROOT_LODEV}" | grep -e '^Block count:' -e '^Block size:')
         IMG_LODEV=$(sudo losetup -f --show "${IMG}")
         [[ -n "${IMG_LODEV}" ]] || quit 1 'Failed to create loop device for the image'
-        sudo sfdisk "${IMG_LODEV}" -N "${#IMG_PART[@]}" <<<"size=$((BC*BS/IMG_BS))" 2>&1 \
+        LC_ALL=C sudo sfdisk "${IMG_LODEV}" -N "${#IMG_PART[@]}" <<<"size=$((BC*BS/IMG_BS))" 2>&1 \
         | grep -v \
             -e '^Re-reading the partition table failed' \
             -e '^The kernel still uses the old table' \
@@ -1342,11 +1432,10 @@ EOFCHROOTCMD
 
         log 'Detach just created loop devices'
         # sudo losetup -d "${LODEV[@]}" "${IMG_LODEV}"
-        sudo losetup -d "${ROOTFS_LODEV}" "${IMG_LODEV}" || quit 1 'Failed to detach loop devices'
+        sudo losetup -d "${ROOT_LODEV}" "${IMG_LODEV}" || quit 1 'Failed to detach loop devices'
 
         log 'Truncating the image (remove trailing unused space)'
-        # shellcheck disable=2162
-        read _ _ e _ < <(sfdisk -l "${IMG}" | grep -m1 -e "^${IMG_PART[$((ROOTFS_PART_NUM-1))]}" | tr -d '*')
+        IFS=$'\n' read -r -d '' _ e < <(exec -c sudo sfdisk --color=never -q -l -o end -- "${IMG}")  # Get End value
         sudo truncate -s $((++e*IMG_BS)) "${IMG}" || quit 1 'Failed to truncate'
         sync
 
@@ -1399,19 +1488,23 @@ flash_image() {
 
     ask_for_sudo_password
 
+    [[ -z "${ROOT_PART_NUM}" ]] && gather_image_info "${IMG}"  # Required to autodetect ROOT_PART_NUM
+
     # Unmount existing SD card partitions if any
     unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
     if ((FLASH)); then
         if ((SDCARD_ERASE_ON_FLASH)); then
-            if ! [[ -c "${SDCARD_ERASE_ON_FLASH_SRC}" ]]; then
-                log "WARNING: Erasing source device is not a character special device. Fallback to /dev/zero"
-                SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'
+            if ! [[ -e "${SDCARD_ERASE_ON_FLASH_SRC}" ]]; then
+                quit 202 "No such file: ${SDCARD_ERASE_ON_FLASH_SRC}"
+            elif ! [[ -c "${SDCARD_ERASE_ON_FLASH_SRC}" ]]; then
+                # log "WARNING: Erasing source device is not a character special device. Fallback to /dev/zero"
+                # SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'
+                log "INFO: Erasing source is not a character special device"
             fi
-            log "Erasing SD card before flashing using ${SDCARD_ERASE_ON_FLASH_SRC} ..."
+            log "Erasing SD card before flashing using ${SDCARD_ERASE_ON_FLASH_SRC}"
             TS=${SECONDS}
-            # LC_ALL=C sudo dd "if=${SDCARD_ERASE_ON_FLASH_SRC}" "of=${SDCARD}" ${DD_BS} ${DD_STATUS} ${DD_OFLAG} 'iflag=fullblock' "conv=${DD_CONV_FSYNC}" 3>&2 2>&1 1>&3- | suppress_progress_msg 'dd:* No space left on device'$'\n' 3>&2 2>&1 1>&3-
-            LC_ALL=C sudo dd "if=${SDCARD_ERASE_ON_FLASH_SRC}" "of=${SDCARD}" ${DD_BS} ${DD_STATUS} ${DD_OFLAG} 'iflag=fullblock' "conv=${DD_CONV_FSYNC}"
+            sudo dd "if=${SDCARD_ERASE_ON_FLASH_SRC}" "of=${SDCARD}" ${DD_BS} ${DD_STATUS} ${DD_OFLAG} 'iflag=fullblock' "conv=${DD_CONV_FSYNC}"
             log "Erasing completed in $((SECONDS-TS))s"
 
             # Speedup image flashing to zeroed SD card using conv=sparse
@@ -1427,7 +1520,7 @@ flash_image() {
         # To fix external automounting tools issues
         unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
-        log "Flashing the image (dd with ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS})..."
+        log "Flashing the image (dd ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS})..."
         TS=${SECONDS}
         sudo dd "if=${IMG}" "of=${SDCARD}" ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS} || quit 23 'Failed to flash the image'
         log "Flashing completed in $((SECONDS-TS))s"
@@ -1436,18 +1529,18 @@ flash_image() {
 
         reread_partitions "${SDCARD}"
 
-        # TODO: autodetect and add all/other partitions (if any)
-        if [[ -b "${SDCARD}p1" && -b "${SDCARD}p2" ]]; then
-            SDCARD_PART=("${SDCART}" "${SDCARD}p1" "${SDCARD}p2")
-        elif [[ -b "${SDCARD}1" && -b "${SDCARD}2" ]]; then
-            SDCARD_PART=("${SDCART}" "${SDCARD}1" "${SDCARD}2")
-        else
-            quit 202 "Cannot find boot and/or rootfs partition(s) on SD card: ${SDCARD}"
+        # Read SDCARD all partitions to SDCARD_PART
+        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } < <(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")
+
+        if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
+            quit 202 "Cannot find partitions on SD card: ${SDCARD}"
         fi
 
-        log 'Check rootfs filesystem for errors'
-        sudo e2fsck -nf "${SDCARD_PART[${ROOTFS_PART_NUM}]}" | tail -n 10
-        ((PIPESTATUS[0]==0)) || quit 1 'Rootfs is not clean after flashing! The image file or SD card might be corrupted or flashed with incorrect options.'
+        if ((ROOT_PART_NUM)); then
+            log 'Checking rootfs filesystem for errors...'
+            sudo e2fsck -nf "${SDCARD_PART[$((ROOT_PART_NUM-1))]}" | tail -n 10
+            ((PIPESTATUS[0]==0)) || quit 1 'Rootfs is not clean after flashing! The image file or SD card might be corrupted or flashed with incorrect options.'
+        fi
     fi
 
 
@@ -1471,93 +1564,127 @@ flash_image() {
         read -r SDCARD_SZ <"/sys/block/${SDCARD_NAME}/size"  # Size in blocks
 
         # SDCARD_ID=$(sudo xxd -s 440 -ps -l 4 "${SDCARD}" | sed -e 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/g')
-        SDCARD_ID="$(LC_ALL=C sudo sfdisk -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+        # SDCARD_ID="$(LC_ALL=C sudo sfdisk --color=never -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+        SDCARD_ID="$(sudo sfdisk -d -- "${SDCARD}" | sed -n 's|label-id: \(0x\)\?\([0-9a-fA-F]*\)|\2|p')"
 
-        # TODO: autodetect number of partitions (ROOTFS_PART_NUM). Now have to be 2
         SDCARD_LAST_PART_NUM=${SDCARD_PARTITION_TABLE##*$'\n'}
         SDCARD_LAST_PART_NUM=${SDCARD_LAST_PART_NUM%%:*}
 
-        # TODO: autodetect and add all/other partitions (if any)
-        if [[ -b "${SDCARD}p1" && -b "${SDCARD}p2" ]]; then
-            SDCARD_PART=("${SDCART}" "${SDCARD}p1" "${SDCARD}p2")
-        elif [[ -b "${SDCARD}1" && -b "${SDCARD}2" ]]; then
-            SDCARD_PART=("${SDCART}" "${SDCARD}1" "${SDCARD}2")
-        else
-            quit 202 "Cannot find boot and/or rootfs partition(s) on SD card: ${SDCARD}"
+        # Detect SDCARD partitions
+        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } < <(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")
+
+        if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
+            quit 202 "Cannot find partitions on SD card: ${SDCARD}"
         fi
 
         # SDCARD_PART[N] aliases
-        SDCARD_PART_BOOT="${SDCARD_PART[1]}"
-        SDCARD_PART_ROOTFS="${SDCARD_PART[${ROOTFS_PART_NUM}]}"
+        SDCARD_PART_ROOT="${SDCARD_PART[$((ROOT_PART_NUM-1))]}"
+        if ((BOOT_PART_NUM)); then
+            SDCARD_PART_BOOT="${SDCARD_PART[$((BOOT_PART_NUM-1))]}"
+        else
+            SDCARD_PART_BOOT=''
+        fi
 
-        BOOT_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_BOOT##*/}"
-        ROOTFS_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_ROOTFS##*/}"
+        IMG_ROOT_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_ROOT##*/}"
+        IMG_MOUNTPOINTS=("${IMG_ROOT_MOUNTPOINT}")
+        if [[ -n "${SDCARD_PART_BOOT}" ]]; then
+            IMG_BOOT_MOUNTPOINT="${MOUNT_DIR}/${SDCARD_PART_BOOT##*/}"
+            # IMG_ROOT_MOUNTPOINT must be specified last, so prependd.
+            IMG_MOUNTPOINTS=("${IMG_BOOT_MOUNTPOINT}" "${IMG_MOUNTPOINTS[@]}")
+        else
+            IMG_BOOT_MOUNTPOINT=''
+        fi
 
         log 'Creating paths for mounting (if required)'
-        mkdir -vp "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}" 2>/dev/null || sudo mkdir -vp "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
+                mkdir -vp "${IMG_MOUNTPOINTS[@]}" 2>/dev/null \
+        || sudo mkdir -vp "${IMG_MOUNTPOINTS[@]}"
 
-        if ((SDCARD_LAST_PART_NUM == ROOTFS_PART_NUM)); then
+        if [[ -z "${ROOT_PART_NUM}" ]]; then
+            log 'WARNING: ROOT_PART_NUM is unknown, cannot expand rootfs. Set explicitly by "--root-part-num".'
+        elif ((SDCARD_LAST_PART_NUM == ROOT_PART_NUM)); then
             # To fix third party automounting issues
             unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
             log 'Resizing rootfs partition to fill full SD card space'
             ((INTERACTIVE)) && o='' || o='-s'
-            sudo parted ${o} -m "${SDCARD}" u s resizepart 2 $((SDCARD_SZ-1)) || quit 1 'Failed to expand rootfs'
+            sudo parted ${o} -m "${SDCARD}" u s resizepart "${ROOT_PART_NUM}" "$((SDCARD_SZ-1))" || quit 1 'Failed to expand rootfs'
             sync
 
             reread_partitions "${SDCARD}"
 
-            SDCARD_ID_NEW="$(LC_ALL=C sudo sfdisk -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+            # SDCARD_ID_NEW="$(LC_ALL=C sudo sfdisk --color=never -l -- "${SDCARD}" | sed -n 's|Disk identifier: 0x\([0-9a-fA-F]*\)|\1|p')"
+            SDCARD_ID_NEW="$(sudo sfdisk -d -- "${SDCARD}" | sed -n 's|label-id: \(0x\)\?\([0-9a-fA-F]*\)|\2|p')"
 
-            if sudo mount -v "${SDCARD_PART_BOOT}" "${BOOT_MOUNTPOINT}"; then
-                log 'Remove init=/usr/lib/raspi-config/init_resize.sh from /boot/cmdline.txt'
-                sudo sed -i 's| init=/usr/lib/raspi-config/init_resize.sh||' "${BOOT_MOUNTPOINT}/cmdline.txt"
-                if ! grep -Fq splash "${BOOT_MOUNTPOINT}/cmdline.txt"; then
-                    log 'Remove quiet from /boot/cmdline.txt because splash specified'
-                    sudo sed -i "s| quiet[ $]| |g" "${BOOT_MOUNTPOINT}/cmdline.txt"
+            # Work with boot partition if exists
+            if [[ -n "${SDCARD_PART_BOOT}" && -n "${IMG_BOOT_MOUNTPOINT}" ]]; then
+                if sudo mount -v "${SDCARD_PART_BOOT}" "${IMG_BOOT_MOUNTPOINT}"; then
+                    # /boot/cmdline.txt is Raspbian specific
+                    if [[ -f "${IMG_BOOT_MOUNTPOINT}/cmdline.txt" ]]; then
+                        log 'Remove init=/usr/lib/raspi-config/init_resize.sh from /boot/cmdline.txt'
+                        sudo sed -i 's| init=/usr/lib/raspi-config/init_resize.sh||' "${IMG_BOOT_MOUNTPOINT}/cmdline.txt"
+
+                        if ! grep -Fq splash "${IMG_BOOT_MOUNTPOINT}/cmdline.txt"; then
+                            log 'Remove quiet from /boot/cmdline.txt because splash specified'
+                            sudo sed -i "s| quiet[ $]| |g" "${IMG_BOOT_MOUNTPOINT}/cmdline.txt"
+                        fi
+
+                        log "Fix rootfs PARTUUID in /boot/cmdline.txt from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
+                        sudo sed -i "s|${SDCARD_ID}|${SDCARD_ID_NEW}|" "${IMG_BOOT_MOUNTPOINT}/cmdline.txt"
+
+                        IFS='' read -rd '' cmdline_txt <"${IMG_BOOT_MOUNTPOINT}/cmdline.txt"
+                        log "Content of ${IMG_BOOT_MOUNTPOINT}/cmdline.txt:"$'\n'"${cmdline_txt}"
+                        unset cmdline_txt
+                    else
+                        log "INFO: /boot/cmdline.txt not found, skipping setup."
+                    fi
+
+                    if [[ -f "${IMG_BOOT_MOUNTPOINT}/config.txt" ]]; then
+                        if ((SD_OVERCLOCK)) && grep -q '^#\s*dtparam=sd_overclock=[0-9]*' "${IMG_BOOT_MOUNTPOINT}/config.txt"; then
+                            log "Enable SD card overclock to ${SD_OVERCLOCK} MHz (only for UHS SD cards)"
+                            sudo sed -i -e "s|^#\s*dtparam=sd_overclock=[0-9]*|dtparam=sd_overclock=${SD_OVERCLOCK}|" "${IMG_BOOT_MOUNTPOINT}/config.txt"
+                        else
+                            log "WARNING: /boot/config.txt not found or incompatible, skipping SD card overclock."
+                        fi
+                    fi
+
+                    sudo umount -v "${IMG_BOOT_MOUNTPOINT}"
+                else
+                    quit 203 "Failed to mount boot SD card partition: ${SDCARD_PART_BOOT}"
                 fi
-                log "Fix rootfs PARTUUID in /boot/cmdline.txt from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
-                sudo sed -i "s/${SDCARD_ID}/${SDCARD_ID_NEW}/" "${BOOT_MOUNTPOINT}/cmdline.txt"
-
-                IFS='' read -rd '' cmdline_txt <"${BOOT_MOUNTPOINT}/cmdline.txt"
-                log "Content of ${BOOT_MOUNTPOINT}/cmdline.txt:"$'\n'"${cmdline_txt}"
-                unset cmdline_txt
-
-                if ((SD_OVERCLOCK)) && grep -q '^#\s*dtparam=sd_overclock=[0-9]*' "${BOOT_MOUNTPOINT}/config.txt"; then
-                    log "Enable SD card overclock to ${SD_OVERCLOCK} MHz (only for UHS SD cards)"
-                    sudo sed -i -e "s|^#\s*dtparam=sd_overclock=[0-9]*|dtparam=sd_overclock=${SD_OVERCLOCK}|" "${BOOT_MOUNTPOINT}/config.txt"
-                fi
-
-                sudo umount -v "${BOOT_MOUNTPOINT}"
-            else
-                quit 203 "Failed to mount boot SD card partition: ${SDCARD_PART_BOOT}"
             fi
 
             log 'Check rootfs filesystem for errors and preen'
-            sudo e2fsck -pf "${SDCARD_PART_ROOTFS}" || quit 1 'Failed to preen rootfs filesystem'
+            sudo e2fsck -pf "${SDCARD_PART_ROOT}" || quit 1 'Failed to preen rootfs filesystem'
             sync
 
             log 'Resizing rootfs to fill partition...'
             ((INTERACTIVE)) && o='-p' || o=''
-            if sudo resize2fs ${o} "${SDCARD_PART_ROOTFS}"; then
-                mkdir -vp "${ROOTFS_MOUNTPOINT}" 2>/dev/null || sudo mkdir -vp "${ROOTFS_MOUNTPOINT}"
-                if sudo mount -v "${SDCARD_PART_ROOTFS}" "${ROOTFS_MOUNTPOINT}"; then
-                    log "Fix rootfs PARTUUID in /etc/fstab from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
-                    sudo sed -i "s/${SDCARD_ID}/${SDCARD_ID_NEW}/g" "${ROOTFS_MOUNTPOINT}/etc/fstab"
+            if sudo resize2fs ${o} "${SDCARD_PART_ROOT}"; then
+                        mkdir -vp "${IMG_ROOT_MOUNTPOINT}" 2>/dev/null \
+                || sudo mkdir -vp "${IMG_ROOT_MOUNTPOINT}"
 
-                    sudo rm -vf -- "${ROOTFS_MOUNTPOINT}/etc/init.d/resize2fs_once"
-                    # shellcheck disable=2181
-                    if (($?==0)); then
-                        # Analog of local command: sudo update-rc.d resize2fs_once remove
-                        for f in "${ROOTFS_MOUNTPOINT}/etc/rc"[0-6S].d/*; do
-                            if [[ "$(exec -c readlink -sen "${f}")" == '/etc/init.d/resize2fs_once' ]]; then
-                                sudo rm -vf -- "${f}"
-                            fi
-                        done
+                if sudo mount -v "${SDCARD_PART_ROOT}" "${IMG_ROOT_MOUNTPOINT}"; then
+                    # TODO: handle non PARTUUID entries, e.g. UUID.
+                    if [[ "${SDCARD_ID}" != "${SDCARD_ID_NEW}" ]] \
+                    && grep -qF "${SDCARD_ID}" "${IMG_ROOT_MOUNTPOINT}/etc/fstab"; then
+                        log "Fix rootfs PARTUUID in /etc/fstab from ${SDCARD_ID} to ${SDCARD_ID_NEW}"
+                        sudo sed -i "s/${SDCARD_ID}/${SDCARD_ID_NEW}/g" "${IMG_ROOT_MOUNTPOINT}/etc/fstab"
                     fi
-                    sudo umount -v "${ROOTFS_MOUNTPOINT}"
+
+                    if [[ -f "${IMG_ROOT_MOUNTPOINT}/etc/init.d/resize2fs_once" ]]; then
+                        log "Removing service resize2fs_once"
+                        if sudo rm -vf -- "${IMG_ROOT_MOUNTPOINT}/etc/init.d/resize2fs_once"; then
+                            # Analog of local command: sudo update-rc.d resize2fs_once remove
+                            for f in "${IMG_ROOT_MOUNTPOINT}/etc/rc"[0-6S].d/*; do
+                                if [[ "$(exec -c readlink -sen "${f}")" == '/etc/init.d/resize2fs_once' ]]; then
+                                    sudo rm -vf -- "${f}"
+                                fi
+                            done
+                        fi
+                    fi
+                    sudo umount -v "${IMG_ROOT_MOUNTPOINT}"
                 else
-                    quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOTFS}"
+                    quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOT}"
                 fi
             else
                 log 'WARNING: Failed to resize rootfs to fill partition'
@@ -1575,38 +1702,37 @@ flash_image() {
     ## END Resizing rootfs to fill SD card
 
 
-    sudo mount -v "${SDCARD_PART_ROOTFS}" "${ROOTFS_MOUNTPOINT}" || quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOTFS}"
+    sudo mount -v "${SDCARD_PART_ROOT}" "${IMG_ROOT_MOUNTPOINT}" || quit 203 "Failed to mount rootfs SD card partition: ${SDCARD_PART_ROOT}"
 
     if ((REGENERATE_SSH_SERVER_KEYS)); then
         log '[Re]generate SSH server keys'
-        for t in rsa ecdsa ed25519; do
-            sudo ssh-keygen -q -f "${ROOTFS_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" -t "$t" -N ''
-            sudo ssh-keygen -l -f "${ROOTFS_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" | sed 's/ root@\w\+//'
+        for t in rsa ecdsa ed25519; do  # TODO: (?) include dsa
+            [[ -f "${IMG_ROOT_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" ]] && sudo rm -vf -- "${IMG_ROOT_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key"
+            sudo ssh-keygen -q -f "${IMG_ROOT_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" -t "$t" -N ''
+            sudo ssh-keygen -l -f "${IMG_ROOT_MOUNTPOINT}/etc/ssh/ssh_host_${t}_key" | sed 's/ root@\w\+//'
         done
     fi
 
-    log "Waiting for the following background processes to complete:"
+    log "Waiting for background processes to complete..."
     jobs -l
     wait
     if ((CERT_GENERATE)); then
         log 'Moving just generated SSL certificates to rootfs and change permissions'
-        sudo mkdir -vp "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}"  # Be sure that this dir exists
-        sudo mv -vfT "${CERT_DH}" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
-        sudo chown 0:0 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
-        sudo chmod 400 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
-        sudo mv -vfT "${CERT_MAIN}.key" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/main.key"
-        sudo mv -vfT "${CERT_MAIN}.crt" "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/main.crt"
-        sudo mv -vfT "${CERT_ANY}.key"  "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/any.key"
-        sudo mv -vfT "${CERT_ANY}.crt"  "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/any.crt"
-        sudo chown 0:0 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.{key,crt}
-        sudo chmod 400 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.key
-        sudo chmod 444 "${ROOTFS_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.crt
+        sudo mkdir -vp "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}"  # Be sure that this dir exists
+        sudo mv -vfT "${CERT_DH}" "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo chown 0:0 "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo chmod 400 "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/dh.pem"
+        sudo mv -vfT "${CERT_MAIN}.key" "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/main.key"
+        sudo mv -vfT "${CERT_MAIN}.crt" "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/main.crt"
+        sudo mv -vfT "${CERT_ANY}.key"  "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/any.key"
+        sudo mv -vfT "${CERT_ANY}.crt"  "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/any.crt"
+        sudo chown 0:0 "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.{key,crt}
+        sudo chmod 400 "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.key
+        sudo chmod 444 "${IMG_ROOT_MOUNTPOINT}${PI_SSL_DIR}/"{main,any}.crt
     fi
 
-    # TODO: unmount all partitions if other than boot and rootfs was mounted
-    sudo umount -v "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"  # ROOTFS_MOUNTPOINT must be specified last
-    sudo rmdir -v -- "${BOOT_MOUNTPOINT}" "${ROOTFS_MOUNTPOINT}"
-    [[  "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+    sudo umount -v "${IMG_MOUNTPOINTS[@]}"
+    sudo rmdir -v -- "${IMG_MOUNTPOINTS[@]}"
 
     sync
     log "Post flashing actions completed in $((SECONDS-TS))s"
@@ -1645,7 +1771,7 @@ check_deps() {
 # Find and install required packages for the script
 ##
 solve_deps() {
-    ## Get the list if all packs are already installed
+    ## Get the list if all installed packages
     # for i in ${DEPENDENCIES}; do dpkg -S $(exec -c readlink -sen $(exec -c which $i)); done | cut -d: -f1 | sort -u | xargs
     PKGS='bsdtar coreutils e2fsprogs grep gzip mount openssl parted passwd sed sudo util-linux wget whois less zerofree'
     ## Install
@@ -1663,19 +1789,6 @@ solve_deps() {
         # Not using --force-yes successors: --allow-downgrades --allow-remove-essential --allow-change-held-packages
         return $?
     fi
-
-
-    ## Draft
-    return
-    local i lst pack
-    lst=()  # Array
-    # TODO: implement. Find packs via apt-file, `dpkg -S` is only for already installed packages.
-    for i in ${DEPENDENCIES}; do
-        pack=$(exec -c dpkg -S "$(exec -c readlink -sen "$(exec -c which "$i")")")
-        pack=${pack%%:*}
-        lst+=("${pack}")
-    done
-    sudo apt-get install "${lst[@]}"
 }
 ### END Functions
 
@@ -1725,17 +1838,6 @@ case "${ACTION}" in
 esac
 
 ((LOG_SCRIPT_VERSION)) && log "pi-img version: ${SCRIPT_VERSION}"
-
-# # Check HOST and TARGET ABI compatibility
-# # TODO: find true way to detect ABI
-# SAME_HOST_TARGET_ABI=0
-# for f in /lib/*; do
-#     if [[ -z "${f/*${TARGET_ABI//-/_}*}" ]]; then
-#         SAME_HOST_TARGET_ABI=1
-#         break
-#     fi
-# done
-# declare -p SAME_HOST_TARGET_ABI
 
 # Quick script dependencies check, for least actions only
 check_deps || quit $?
@@ -1792,6 +1894,16 @@ for ((i=0;i<${#ARGS[@]};i++)); do
         --rootfs-changes-tarball)
             ROOTFS_CHANGES_TARBALL=${ARGS[$((++i))]}
             [[ -f "${ROOTFS_CHANGES_TARBALL}" ]] || quit 1 "No such file: ${ROOTFS_CHANGES_TARBALL}"
+            ;;
+
+        --root-part-num)
+            ROOT_PART_NUM=${ARGS[$((++i))]}
+            [[ "${ROOT_PART_NUM}" =~ ^[1-9][0-9]*$ ]] || quit 1 "ROOT_PART_NUM is not a positive number: ${ROOT_PART_NUM}"
+            ;;
+
+        --boot-part-num)
+            BOOT_PART_NUM=${ARGS[$((++i))]}
+            [[ "${BOOT_PART_NUM}" =~ ^[1-9][0-9]*$ ]] || quit 1 "BOOT_PART_NUM is not a positive number: ${BOOT_PART_NUM}"
             ;;
 
         --source-image-url|-u)
@@ -1860,7 +1972,7 @@ for ((i=0;i<${#ARGS[@]};i++)); do
 
         --sdcard-erase-on-flash-src)
             SDCARD_ERASE_ON_FLASH_SRC=${ARGS[$((++i))]}
-            [[ -c "${SDCARD_ERASE_ON_FLASH_SRC}" ]] || quit 1 "Not a character special device: ${SDCARD_ERASE_ON_FLASH_SRC}"
+            [[ -e "${SDCARD_ERASE_ON_FLASH_SRC}" ]] || quit 1 "No such file: ${SDCARD_ERASE_ON_FLASH_SRC}"
             ;;
 
         --dd-bs)
@@ -2019,7 +2131,7 @@ cd "${WORK_DIR}" || quit 1 "Failed to change directory to WORK_DIR: ${WORK_DIR}"
 
 [[ -z "${TMP_DIR}" ]] && TMP_DIR="${TMP_DIR_DEFAULT_DIRNAME}/${TMP_DIR_DEFAULT_BASENAME}"
 if ! [[ -d "${TMP_DIR}" ]]; then
-    log 'Creating temporary directory'
+    log "Creating temporary directory: ${TMP_DIR}"
     mkdir -vp "${TMP_DIR}" 2>/dev/null || sudo mkdir -vp "${TMP_DIR}" || quit 1 'Failed to create temporary directory'
 fi
 
@@ -2056,21 +2168,12 @@ fi
 ### Main case
 case "${ACTION}" in
     create)
-        # Check for CPU arch compatibility
-        # TODO: check ABI instead of CPU arch
-        if [[ "${HOST_CPU_ARCH}" != "${TARGET_CPU_ARCH}" ]]; then
-            quit 1 "Host and target CPU architectures are incompatible for image creation: ${HOST_CPU_ARCH} vs ${TARGET_CPU_ARCH}"
-        fi
-
         # Ask for PI_IMAGE_VERSION if not set or invalid
         [[ -z "${PI_IMAGE_VERSION}" && "${INTERACTIVE}" -eq 0 ]] && quit 240 'Unable to ask for disk image version version because of non-interactive mode'
         for ((i=0;i<3;i++)); do
             [[ "${PI_IMAGE_VERSION}" =~ ^[0-9a-zA-Z._]+$ ]] && break
             ((i)) && echo 'Only alphanumeric characters with dot and underscore supported! Just number or "dev" are suitable choises.' >&2
-            # [[ "${PI_IMAGE_VERSION}" =~ ^[0-9]+$ || "${PI_IMAGE_VERSION}" == 'dev' ]] && break
-            # ((i)) && echo 'Only positive numbers or "dev" supported!' >&2
-            # shellcheck disable=2162
-            read -p "Enter disk image version (attempt $((i+1))/3): " PI_IMAGE_VERSION
+            read -r -p "Enter disk image version (attempt $((i+1))/3): " PI_IMAGE_VERSION
         done
         ((i<3)) || quit 1 'No valid disk image version specified'
 
@@ -2111,7 +2214,7 @@ case "${ACTION}" in
         [[ "${RASPBIAN_NAME: -4}" != '.img' ]] && RASPBIAN_NAME+='.img'  # Add 'img' extension if absent
         unset SOURCE_IMAGE_URL_FILENAME
 
-        # Generate RASPBIAN_IMG
+        # Generate RASPBIAN_IMG variable
         RASPBIAN_IMG="${WORK_DIR}/${RASPBIAN_NAME}"  # Will be downloaded if empty or does not exists
 
         create_image
@@ -2140,31 +2243,26 @@ case "${ACTION}" in
         ((i<3)) || quit 1 'No valid SD card specified'
 
         # Some validations
-        # # Commented because not all `file` versions support extended output
-        # out=$(exec -c file -- "${IMG}")
-        # if [[ -n "${out/* partition 2 */}" ]]
-        #     quit 4 "The image is broken (at least has no 2nd partition): ${out}"
-        # fi
-        if ! sfdisk -l -- "${IMG}" | grep -qe "^${IMG}2 "; then
-            quit 4 "The image is broken (at least has no 2nd partition)"
+        if [[ -z "$(exec -c sudo sfdisk --color=never -q -l -o device -- "${IMG}")" ]]; then
+            log "WARNING: The image may be broken: no partitions found"
         fi
 
         flash_image "${IMG}"
         rval=$?
-        [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+        # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
         ;;
 
     mount)
-        [[ -f "${IMG}" ]] || quit 1 'Disk image not found'
+        [[ -f "${IMG}" || -b "${IMG}" ]] || quit 1 'Disk image not found'
         mount_img "${IMG}"
         rval=$?
         ;;
 
     umount|unmount)
-        [[ -f "${IMG}" ]] || quit 1 'Disk image not found'
+        [[ -f "${IMG}" || -b "${IMG}" ]] || quit 1 'Disk image not found'
         umount_img "${IMG}" --rmdir
         rval=$?
-        [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
+        # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
         ;;
 esac
 

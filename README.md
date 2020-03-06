@@ -10,6 +10,7 @@ Creates wireless Access Point (AP) on specified interface and configure local DH
 Compatible only with single AP hosts, if other APs exists their setup can be overwritten!
 
 ### [pi-img](pi-img)
+Helps to manage disk images for single board computers: create, flash, mount, modify.
 
 ### [pi-reset](pi-reset)
 Resets host to factory state.
