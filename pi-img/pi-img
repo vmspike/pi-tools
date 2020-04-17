@@ -168,7 +168,7 @@ OPTIONS
         It will be also used as a first part of the final disk image name.
 
         Defaults to automatically extract from --source-image-url value if
-        exists and available, or drop to "raspbian.img".
+        exists and available, or fallback to "raspbian.img".
 
     --pi-image-version, -v PI_IMAGE_VERSION
         Disk image version. Alphanumeric characters with dot and underscore only.
@@ -404,7 +404,7 @@ OPTIONS
         In non-interactive mode the script will exit if situation cannot be
         solved without user intervention.
 
-        If the shell itself is not interactive the script drop to non-
+        If the shell itself is not interactive the script fallback to non-
         interactive mode regardless of specified value or defaults.
 
         Defaults to 1 (interactive).
@@ -513,7 +513,7 @@ EOFUSAGE
 export LC_ALL=C  # To avoid locale issues
 TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
 WGET_TIMEOUTS='--dns-timeout=10 --connect-timeout=20 --read-timeout=30'
-DEPENDENCIES='grep zgrep ls cp wget bsdtar mv sfdisk parted tr sudo umount mount mkdir chmod chown ln usermod sed dd mkpasswd realpath touch rmdir uname losetup sync mktemp fallocate blockdev e2fsck resize2fs openssl tail tune2fs truncate tee sort'  # The script dependencies
+DEPENDENCIES='grep zgrep ls cp wget bsdtar mv sfdisk parted tr sudo umount mount mkdir chmod chown ln usermod sed dd mkpasswd realpath touch rmdir uname losetup sync mktemp fallocate blockdev e2fsck resize2fs openssl tail tune2fs truncate tee sort blkdiscard'  # The script dependencies
 DEPENDENCIES_OPTIONAL='less zerofree'  # The script optional dependencies, other tools will be used instead if does not exist.
 
 # Default compression level for xz compressor (used in image pack creation).
@@ -539,7 +539,7 @@ HOST_CPU_ARCH=$(exec -c uname -m)  # CPU arch of the host where the script execu
 WORK_DIR=${PWD}  # PWD is the current working directory as set by the cd command
 SOURCE_IMAGE_URL='https://downloads.raspberrypi.org/raspbian_lite_latest'
 SOURCE_IMAGE_URL_FILENAME=''  # Temporary empty initial variable for SOURCE_IMAGE_URL
-RASPBIAN_NAME=''  # By default will be get from commandline args, SOURCE_IMAGE_URL, or drop to raspbian.img
+RASPBIAN_NAME=''  # By default will be get from commandline args, SOURCE_IMAGE_URL, or fallback to raspbian.img
 PI_IMAGE_VERSION=''  # User will be prompted if empty
 DEFAULT_PI_PASSWORD=''  # Will be used for user (with id 1000) initial password
 KEEP_SRC_IMAGE=1  # Keep base Raspbian image unmodified. If false disk image will overwrite it (faster).
@@ -591,7 +591,7 @@ SD_OVERCLOCK=0
 
 # Post flashing options
 POST_FLASHING=0
-CERT_GENERATE=0  # Create web certs
+CERT_GENERATE=0  # Create self-signed SSL certs
 EXPAND_ROOTFS=0  # Expand rootfs to fill all SD card space on postflashing
 REGENERATE_SSH_SERVER_KEYS=1  # Regenerate ssh keys on postflashing
 
@@ -647,7 +647,7 @@ quit() {
         fi
     fi
 
-    # TODO: check if dir is empty to avoid useless log output, --ignore-fail-on-non-empty is not usitable because suppress all error messagess.
+    # TODO: check if dir is empty to avoid useless log output, --ignore-fail-on-non-empty is not usable because suppress all error messagess.
     [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
 
     sync
@@ -865,7 +865,7 @@ gather_image_info() {
             IMG_PART_SIZE+=("${sz}")
             IMG_PART_TYPE+=("${tp}")
         done
-    } < <(LC_ALL=C exec sudo sfdisk --color=never -q -l -o device,start,end,sectors,size,type -- "${IMG}")
+    } <<<"$(LC_ALL=C exec sudo sfdisk --color=never -q -l -o device,start,end,sectors,size,type -- "${IMG}")"
 
     # TODO: implement deeper verification
     if  [[ -z "${IMG_BS}" \
@@ -1004,7 +1004,7 @@ umount_img() {
         # shellcheck disable=2162
         while read l; do
             tmploop+=("${l%%: *}")
-        done < <(losetup -j "${IMG}" | sort)  # "sort" required to unmount rootfs partition last
+        done <<<"$(losetup -j "${IMG}" | sort)"  # "sort" required to unmount rootfs partition last
         if [[ -n "${tmploop[*]}" ]]; then
             if [[ "$2" == '--rmdir' ]]; then
                 # TODO: Fix the case when it's more than 10 loop devices
@@ -1012,7 +1012,7 @@ umount_img() {
                 # shellcheck disable=2034,2068,2162
                 while read l m n; do
                     tmpmp+=("${m}")
-                done < <(exec -c grep ${tmploop[@]/#/-e ^} /proc/mounts)
+                done <<<"$(exec -c grep ${tmploop[@]/#/-e ^} /proc/mounts)"
             fi
             log 'Unmounting already mounted partitions assosiated with the image:'
             # sudo umount -vA "${tmploop[@]}" || return $?
@@ -1049,8 +1049,8 @@ umount_img() {
 create_image() {
     local tmp o i v l m t out
 
-    log "Current work dir: ${WORK_DIR}"
     cd "${WORK_DIR}" || quit 1 "Failed to change directory to WORK_DIR: ${WORK_DIR}"
+    log "Current work dir: ${WORK_DIR}"
 
     ## Create/be_sure sparse Raspbian exists
     if [[ -f "${RASPBIAN_IMG}" ]]; then
@@ -1387,7 +1387,6 @@ EOFCHROOTCMD
     fallocate -vd -- "${IMG}" || log 'ERROR: Failed to sparsify'
 
     umount_img "${IMG}" --rmdir || log 'ERROR: Failed to unmount image partitions.'
-    # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
 
     if ((SHRINK_ROOTFS)); then
         log 'Shrinking rootfs filesystem and partition to minimize final image virtual size...'
@@ -1418,8 +1417,8 @@ EOFCHROOTCMD
 
         log 'Shrink rootfs partition'
         # shellcheck disable=2162
-        { read _ _ BC; read _ _ BS; } < <(LC_ALL=C sudo tune2fs -l "${ROOT_LODEV}" | grep -e '^Block count:' -e '^Block size:')
-        IMG_LODEV=$(sudo losetup -f --show "${IMG}")
+        { read _ _ BC; read _ _ BS; } <<<"$(LC_ALL=C sudo tune2fs -l "${ROOT_LODEV}" | grep -e '^Block count:' -e '^Block size:')"
+        IMG_LODEV=$(exec -c sudo losetup -f --show "${IMG}")
         [[ -n "${IMG_LODEV}" ]] || quit 1 'Failed to create loop device for the image'
         LC_ALL=C sudo sfdisk "${IMG_LODEV}" -N "${#IMG_PART[@]}" <<<"size=$((BC*BS/IMG_BS))" 2>&1 \
         | grep -v \
@@ -1435,7 +1434,7 @@ EOFCHROOTCMD
         sudo losetup -d "${ROOT_LODEV}" "${IMG_LODEV}" || quit 1 'Failed to detach loop devices'
 
         log 'Truncating the image (remove trailing unused space)'
-        IFS=$'\n' read -r -d '' _ e < <(exec -c sudo sfdisk --color=never -q -l -o end -- "${IMG}")  # Get End value
+        IFS=$'\n' read -r -d '' _ e <<<"$(exec -c sudo sfdisk --color=never -q -l -o end -- "${IMG}")"  # Get End value
         sudo truncate -s $((++e*IMG_BS)) "${IMG}" || quit 1 'Failed to truncate'
         sync
 
@@ -1494,6 +1493,7 @@ flash_image() {
     unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
     if ((FLASH)); then
+        # TODO: consider blkdiscard with --zeroout and/or --secure for some cases
         if ((SDCARD_ERASE_ON_FLASH)); then
             if ! [[ -e "${SDCARD_ERASE_ON_FLASH_SRC}" ]]; then
                 quit 202 "No such file: ${SDCARD_ERASE_ON_FLASH_SRC}"
@@ -1520,6 +1520,9 @@ flash_image() {
         # To fix external automounting tools issues
         unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
+        log 'Discarding all SD card sectors to increase endurance and performance (wear-leveling)'
+        sudo blkdiscard -v "${IMG}" || log 'WARNING: Some USB cardreaders may not support this call, native SD cardreader is recommended.'
+
         log "Flashing the image (dd ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS})..."
         TS=${SECONDS}
         sudo dd "if=${IMG}" "of=${SDCARD}" ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS} || quit 23 'Failed to flash the image'
@@ -1530,7 +1533,7 @@ flash_image() {
         reread_partitions "${SDCARD}"
 
         # Read SDCARD all partitions to SDCARD_PART
-        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } < <(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")
+        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } <<<"$(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")"
 
         if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
             quit 202 "Cannot find partitions on SD card: ${SDCARD}"
@@ -1550,6 +1553,8 @@ flash_image() {
     TS=${SECONDS}
 
     ## Resizing rootfs to fill SD card
+    # TODO: consider to keep some unpartitioned space as Armbian do for performance reasons:
+    # https://forum.armbian.com/topic/3776-the-partition-is-not-resized-to-full-sd-card-size/?do=findComment&comment=27413
     if ((EXPAND_ROOTFS)); then
         # Rootfs resizing can sppedup first boot and/or
         # help when cloned image is used as a source with auto resizing by OS already disabled.
@@ -1571,7 +1576,7 @@ flash_image() {
         SDCARD_LAST_PART_NUM=${SDCARD_LAST_PART_NUM%%:*}
 
         # Detect SDCARD partitions
-        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } < <(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")
+        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } <<<"$(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")"
 
         if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
             quit 202 "Cannot find partitions on SD card: ${SDCARD}"
@@ -2148,7 +2153,8 @@ fi
 export XZ_OPT
 
 # status=progress introduces in dd version 8.24, do not use it with older verions
-DD_VERSION=$(LC_ALL=C dd --version | grep -m1 -o '[0-9]\+\.[0-9]\+')  # Only two first numbers
+# DD_VERSION=$(LC_ALL=C dd --version | grep -m1 -o '[0-9]\+\.[0-9]\+')
+read _ _ DD_VERSION <<<"$(exec -c dd --version)"
 printf -v DD_VERSION '%d%03d' "${DD_VERSION%%.*}" "${DD_VERSION#*.}"
 if ((DD_VERSION < 8024)) && [[ "${DD_STATUS}" == 'progress' ]]; then
     DD_STATUS=''
@@ -2185,8 +2191,8 @@ case "${ACTION}" in
             # SOURCE_IMAGE_URL_FILENAME set based on the url filename
             RASPBIAN_NAME=${SOURCE_IMAGE_URL_FILENAME}
             if [[ -z "${RASPBIAN_NAME/*\/*/}" ]]; then  # / in the name or empty
-                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, drop to default
-                log "Failed to extract Raspbian image filename from url, drop to: ${RASPBIAN_NAME}"
+                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, fallback to default
+                log "Failed to extract Raspbian image filename from url, fallback to: ${RASPBIAN_NAME}"
             fi
         else
             # Get RASPBIAN_NAME from default SOURCE_IMAGE_URL
@@ -2203,8 +2209,8 @@ case "${ACTION}" in
                 wget_filename=${wget_filename##*/}
             fi
             if [[ -z "${wget_filename}" ]]; then
-                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, drop to default
-                log "Failed to extract Raspbian image filename from url, drop to: ${RASPBIAN_NAME}"
+                RASPBIAN_NAME='raspbian'  # URL/filename is unavailable, fallback to default
+                log "Failed to extract Raspbian image filename from url, fallback to: ${RASPBIAN_NAME}"
             else
                 RASPBIAN_NAME=${wget_filename%\.*}  # With extension removed (probably .zip)
                 log "Autodetected Raspbian image name: ${RASPBIAN_NAME}"
@@ -2249,7 +2255,6 @@ case "${ACTION}" in
 
         flash_image "${IMG}"
         rval=$?
-        # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
         ;;
 
     mount)
@@ -2262,7 +2267,6 @@ case "${ACTION}" in
         [[ -f "${IMG}" || -b "${IMG}" ]] || quit 1 'Disk image not found'
         umount_img "${IMG}" --rmdir
         rval=$?
-        # [[ "${TMP_DIR##*/}" == "${TMP_DIR_DEFAULT_BASENAME}" && -d "${TMP_DIR}" ]] && sudo rmdir -v -- "${TMP_DIR}"
         ;;
 esac
 
