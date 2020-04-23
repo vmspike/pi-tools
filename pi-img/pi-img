@@ -237,6 +237,32 @@ OPTIONS
 
         Defaults to "/dev/zero".
 
+    --sdcard-verify-integrity [0|1]
+        After flashing verify that the image written to SD card matches
+        original image. It verifies only leading part of SD card of the same
+        size as the image, so it does not protect against "fake SD card size"
+        issue if the image size is relatively small.
+
+        Defaults to 1 (verify)
+
+    --sdcard-check-rootfs-for-errors [0|1]
+        After flashing check rootfs filesystem for errors.
+
+        Defaults to 0 (do not check)
+
+    --sdcard-verify-real-size [0|1]
+        Not implemented!
+            You may use f3probe instead (from f3 package), e.g. on unmounted SD run:
+                sudo f3probe --destructive --time-ops /dev/SDCARD
+            For more info visit https://fight-flash-fraud.readthedocs.io
+
+        Verify that SD card size reported by controller match real size.
+        You may want to run it once for new/unknown SD cards to be sure that
+        SD card is not a fake, e.g. detected as 64GB but real size is 8GB, all
+        data higher will be lost.
+
+        Defaults to 0 (do not verify)
+
     --dd-bs DD_BS
         dd "bs" (block size) option. See "man dd" for more info.
         It's not recommended to set this value to less than 512.
@@ -513,8 +539,8 @@ EOFUSAGE
 export LC_ALL=C  # To avoid locale issues
 TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
 WGET_TIMEOUTS='--dns-timeout=10 --connect-timeout=20 --read-timeout=30'
-DEPENDENCIES='grep zgrep ls cp wget bsdtar mv sfdisk parted tr sudo umount mount mkdir chmod chown ln usermod sed dd mkpasswd realpath touch rmdir uname losetup sync mktemp fallocate blockdev e2fsck resize2fs openssl tail tune2fs truncate tee sort blkdiscard'  # The script dependencies
-DEPENDENCIES_OPTIONAL='less zerofree'  # The script optional dependencies, other tools will be used instead if does not exist.
+DEPENDENCIES='blkdiscard blockdev bsdtar chmod chown cmp cp dd e2fsck fallocate grep ln losetup ls mkdir mkpasswd mktemp mount mv openssl parted realpath resize2fs rmdir sed sfdisk sort stat sudo sync tail tee touch tr truncate tune2fs umount uname usermod wget zgrep'  # The script dependencies
+DEPENDENCIES_OPTIONAL='f3probe less zerofree'  # The script optional dependencies, other tools will be used instead if does not exist.
 
 # Default compression level for xz compressor (used in image pack creation).
 # -9 use 65M for unpack, -8 use 33M, -7 use 17M (for others see "man xz"),
@@ -546,6 +572,10 @@ KEEP_SRC_IMAGE=1  # Keep base Raspbian image unmodified. If false disk image wil
 SDCARD=''  # The device name of SD cardreader, empty to ask interactively, can be like /dev/mmcblk0
 SDCARD_ERASE_ON_FLASH=0  # If SD card need to be erased before flashing (mostly for security reasons)
 SDCARD_ERASE_ON_FLASH_SRC='/dev/zero'  # Source device to use for erasing, /dev/zero and /dev/urandom are reasonable choices
+
+SDCARD_VERIFY_INTEGRITY=1
+SDCARD_VERIFY_REAL_SIZE=0
+SDCARD_CHECK_ROOTFS_FOR_ERRORS=0
 
 DD_BS=8M  # Default dd block size (only for some dd commands), 1M is 1048576
 DD_CONV=''  # Default dd conv option (only for flash dd command)
@@ -1521,28 +1551,37 @@ flash_image() {
         unmount_mounted_partitions "${SDCARD}" || quit 22 'Failed to unmount device partition(s)'
 
         log 'Discarding all SD card sectors to increase endurance and performance (wear-leveling)'
-        sudo blkdiscard -v "${IMG}" || log 'WARNING: Some USB cardreaders may not support this call, native SD cardreader is recommended.'
+        sudo blkdiscard -v "${SDCARD}" || log 'WARNING: Some USB cardreaders may not support discard call, native SD cardreader is recommended.'
 
         log "Flashing the image (dd ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS})..."
         TS=${SECONDS}
         sudo dd "if=${IMG}" "of=${SDCARD}" ${DD_BS} ${DD_CONV} ${DD_OFLAG} ${DD_STATUS} || quit 23 'Failed to flash the image'
         log "Flashing completed in $((SECONDS-TS))s"
 
-        # TODO: optionally verify integrity by comparing original image and flashed SD card and/or by checking for badblocks via e2fsck -kfc
-
-        reread_partitions "${SDCARD}"
-
-        # Read SDCARD all partitions to SDCARD_PART
-        { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } <<<"$(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")"
-
-        if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
-            quit 202 "Cannot find partitions on SD card: ${SDCARD}"
+        if ((SDCARD_VERIFY_INTEGRITY)); then
+            log 'Verifying intergity of just written image'
+            if sudo cmp --print-bytes --bytes="$(exec -c stat --format='%s' "${IMG}")" "${IMG}" "${SDCARD}"; then
+                log "Integrity verified"
+            else
+                quit 202 "Integrity test failed. SD card can be corrupted or flashed with incorrect options."
+            fi
         fi
 
-        if ((ROOT_PART_NUM)); then
-            log 'Checking rootfs filesystem for errors...'
-            sudo e2fsck -nf "${SDCARD_PART[$((ROOT_PART_NUM-1))]}" | tail -n 10
-            ((PIPESTATUS[0]==0)) || quit 1 'Rootfs is not clean after flashing! The image file or SD card might be corrupted or flashed with incorrect options.'
+        if ((SDCARD_CHECK_ROOTFS_FOR_ERRORS)); then
+            reread_partitions "${SDCARD}"
+
+            # Read SDCARD all partitions to SDCARD_PART
+            { read; IFS=$'\n' read -r -d '' -a SDCARD_PART; } <<<"$(exec -c sudo sfdisk -q -l -o device -- "${SDCARD}")"
+
+            if ! [[ -n "${SDCARD_PART[*]}" && -b "${SDCARD_PART[0]}" ]]; then
+                quit 202 "Cannot find partitions on SD card: ${SDCARD}"
+            fi
+
+            if ((ROOT_PART_NUM)); then
+                log 'Checking rootfs filesystem for errors...'
+                sudo e2fsck -nf "${SDCARD_PART[$((ROOT_PART_NUM-1))]}" | tail -n 10
+                ((PIPESTATUS[0]==0)) || quit 1 'Rootfs is not clean after flashing! The image file or SD card might be corrupted or flashed with incorrect options.'
+            fi
         fi
     fi
 
@@ -1778,7 +1817,7 @@ check_deps() {
 solve_deps() {
     ## Get the list if all installed packages
     # for i in ${DEPENDENCIES}; do dpkg -S $(exec -c readlink -sen $(exec -c which $i)); done | cut -d: -f1 | sort -u | xargs
-    PKGS='bsdtar coreutils e2fsprogs grep gzip mount openssl parted passwd sed sudo util-linux wget whois less zerofree'
+    PKGS='bsdtar coreutils diffutils e2fsprogs f3 grep gzip less mount openssl parted passwd sed sudo util-linux wget whois zerofree'
     ## Install
     log "WARNING: ${ACTION} is experimental!"
     hash apt-get 2>/dev/null || quit 1 'Not a Debian derivative (no apt-get), cannot satisfy dependencies automatically'
@@ -1980,6 +2019,12 @@ for ((i=0;i<${#ARGS[@]};i++)); do
             [[ -e "${SDCARD_ERASE_ON_FLASH_SRC}" ]] || quit 1 "No such file: ${SDCARD_ERASE_ON_FLASH_SRC}"
             ;;
 
+        --sdcard-verify-integrity) SDCARD_VERIFY_INTEGRITY=${ARGS[$((++i))]};;
+
+        --sdcard-verify-real-size) SDCARD_VERIFY_REAL_SIZE=${ARGS[$((++i))]};;
+
+        --sdcard-check-rootfs-for-errors) SDCARD_CHECK_ROOTFS_FOR_ERRORS=${ARGS[$((++i))]};;
+
         --dd-bs)
             DD_BS=${ARGS[$((++i))]}
             [[ "${DD_BS}" =~ ^[1-9][0-9]*(c|w|b|kB|K|MB|M|xM|GB|G|T)?$ ]] || quit 1 "Invalid dd block size: ${DD_BS}"
@@ -2110,7 +2155,7 @@ done
 # esac
 
 # Convert boolean vars to 0 or 1
-for o in KEEP_SRC_IMAGE SDCARD_ERASE_ON_FLASH EARLY_BOOT_SSH TAR_PACK INTERACTIVE APT_DIST_UPGRADE APT_UPGRADE APT_AUTOREMOVE POST_FLASHING CERT_GENERATE FLASH SHRINK_ROOTFS EXPAND_ROOTFS REGENERATE_SSH_SERVER_KEYS AUTOMOUNTING_ENABLED
+for o in APT_AUTOREMOVE APT_DIST_UPGRADE APT_UPGRADE AUTOMOUNTING_ENABLED CERT_GENERATE EARLY_BOOT_SSH EXPAND_ROOTFS FLASH INTERACTIVE KEEP_SRC_IMAGE POST_FLASHING REGENERATE_SSH_SERVER_KEYS SDCARD_ERASE_ON_FLASH SDCARD_VERIFY_INTEGRITY SDCARD_CHECK_ROOTFS_FOR_ERRORS SDCARD_VERIFY_REAL_SIZE SHRINK_ROOTFS TAR_PACK
 do
     case "${!o,,}" in
         # 'on' and 'off' removed from choices to avoid mistype no/on
@@ -2123,7 +2168,7 @@ do
 done
 
 # Get rid of relative paths, use absolute paths
-for o in SDCARD_ERASE_ON_FLASH_SRC SDCARD IMG MOUNT_DIR WORK_DIR TMP_DIR ROOTFS_CHANGES_DIR
+for o in IMG MOUNT_DIR ROOTFS_CHANGES_DIR SDCARD SDCARD_ERASE_ON_FLASH_SRC TMP_DIR WORK_DIR
 do
     [[ -z "${!o}" ]] && continue  # Ignore empty variables
     tmp=$(exec -c realpath "${!o}") || quit 1 "Failed to get real path: ${!o}"
@@ -2154,7 +2199,7 @@ export XZ_OPT
 
 # status=progress introduces in dd version 8.24, do not use it with older verions
 # DD_VERSION=$(LC_ALL=C dd --version | grep -m1 -o '[0-9]\+\.[0-9]\+')
-read _ _ DD_VERSION <<<"$(exec -c dd --version)"
+read -r _ _ DD_VERSION <<<"$(exec -c dd --version)"
 printf -v DD_VERSION '%d%03d' "${DD_VERSION%%.*}" "${DD_VERSION#*.}"
 if ((DD_VERSION < 8024)) && [[ "${DD_STATUS}" == 'progress' ]]; then
     DD_STATUS=''
@@ -2255,6 +2300,7 @@ case "${ACTION}" in
 
         flash_image "${IMG}"
         rval=$?
+        ((rval==0)) && log "OK: Now you can physically detach SD card ${SDCARD}"
         ;;
 
     mount)
