@@ -224,18 +224,21 @@ OPTIONS
     --sdcard-erase-on-flash [0|1]
     -e1, -e
     -e0
-        If SD card needs to be erased before flashing (takes few minutes
-        depends on SD card speed).
-        Can be specified for security reasons to completely remove previous SD
-        card content.
+        If SD card needs to be erased before flashing. It may take few minutes
+        depends on SD card speed.
+        Can be specified for security reasons to remove previous SD card content.
 
-        Defaults to 0 (not erase).
+        Warning: Because of the nature of SD card some cells could be not really
+        erased but only marked as empty, so it's not clear if such erasing is
+        secure enough.
+
+        Defaults to 0 (do not erase).
 
     --sdcard-erase-on-flash-src SDCARD_ERASE_ON_FLASH_SRC
         Source device to use for erasing.
-        "/dev/zero" and "/dev/urandom" are reasonable choices.
+        /dev/zero and /dev/urandom are reasonable choices.
 
-        Defaults to "/dev/zero".
+        Defaults to /dev/zero
 
     --sdcard-verify-integrity [0|1]
         After flashing verify that the image written to SD card matches
@@ -256,7 +259,7 @@ OPTIONS
                 sudo f3probe --destructive --time-ops /dev/SDCARD
             For more info visit https://fight-flash-fraud.readthedocs.io
 
-        Verify that SD card size reported by controller match real size.
+        Verify that SD card size reported by controller matches real size.
         You may want to run it once for new/unknown SD cards to be sure that
         SD card is not a fake, e.g. detected as 64GB but real size is 8GB, all
         data higher will be lost.
@@ -473,7 +476,7 @@ EXAMPLES
     # Fast flash with default options
     pi-img flash ./path/to/pi.img /dev/mmcblk0
 
-    # Slow but secure flash, all previously existing data erased and filled by
+    # Slow but secure(?) flash, all previously existing data erased and filled by
     # pseudo random data before flashing, then flashed as is (do not skip NUL
     # input blocks).
     pi-img flash --img ./pi.img --sdcard /dev/mmcblk0 \
@@ -960,7 +963,16 @@ mount_img() {
 
     log 'Mounting all partitions from the disk image:'
     for ((i=0;i<${#IMG_PART[@]};++i)); do
-        sudo mount -v -o loop,rw,offset=$((IMG_PART_START[i]*IMG_BS)),sizelimit=$((IMG_PART_SECTORS[i]*IMG_BS)) "${IMG}" "${IMG_MOUNTPOINTS[$i]}" || quit 6 "Failed to mount partition $((++i))"
+        case "${IMG_PART_TYPE[$i]}" in
+            'BIOS boot'|MBR)
+                log "Ignoring partition $((i+1)) of type ${IMG_PART_TYPE[$i]}"
+                continue
+                ;;
+        esac
+        sudo mount -v -o loop,rw,offset=$((IMG_PART_START[i]*IMG_BS)),sizelimit=$((IMG_PART_SECTORS[i]*IMG_BS)) "${IMG}" "${IMG_MOUNTPOINTS[$i]}" \
+        || quit 6 "Failed to mount partition $((i+1))"
+        # sudo mount -v -o loop,ro,offset=$((IMG_PART_START[i]*IMG_BS)),sizelimit=$((IMG_PART_SECTORS[i]*IMG_BS)) "${IMG}" "${IMG_MOUNTPOINTS[$i]}" \
+        # || log "WARNING: Failed to mount partition $((i+1))"
     done
 
     # Trying to autodetect ROOT_PART_NUM and corresponding BOOT_PART_NUM by the presence of /etc/fstab

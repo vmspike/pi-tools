@@ -87,7 +87,7 @@ CONFIG='/etc/pi-reset.conf'
 ## END Defaults
 
 # Read CONFIG from commandline args if specified as a first argument
-if [[ "$1" == '--config' ]] && [[ -n $2 ]]; then
+if [[ "$1" == '--config' && -n "$2" ]]; then
     CONFIG="$2"
     shift 2
 fi
@@ -438,7 +438,7 @@ wget -q --show-progress --dns-timeout=10 --connect-timeout=20 --read-timeout=30 
 if ((${PIPESTATUS[0]})); then
     # Try to bind to existing interfaces (retry on previous interface too)
     for ip in $(exec -c hostname -I); do
-        wget -q --show-progress --dns-timeout=10 --connect-timeout=20 --read-timeout=30 ${CHECK_CERT} "${IMG_URL}" -O pi.img.txz 2>&1 | ( i=0; while read l; do ((i++ && i%256)) || log "${l##*.... }"; done )  # The same command as above
+        wget -c -q --show-progress --dns-timeout=10 --connect-timeout=20 --read-timeout=30 ${CHECK_CERT} "${IMG_URL}" -O pi.img.txz 2>&1 | ( i=0; while read l; do ((i++ && i%256)) || log "${l##*.... }"; done )  # The same command as above
         rcode=${PIPESTATUS[0]}
         ((rcode)) || break
     done
